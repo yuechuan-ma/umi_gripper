@@ -5,12 +5,11 @@ from gripper import Gripper, GripperError
 
 def main():
     try:
-        with Gripper() as gripper:
+        gripper = Gripper()
+        try:
             channels = sorted(gripper.channels)
             for channel in channels:
-                if not gripper.home(channel):
-                    return
-                print(f"{channel} 号回零后的当前开度：{gripper.get_width(channel):.3f}")
+                print(f"{channel} 号舵机已连接，正在读取当前位置。")
             while True:
                 choice = (
                     input("输入“开度 通道号”（例如 0.8 0），或 q 退出：")
@@ -31,6 +30,8 @@ def main():
                 result = gripper.wait(channel=channel)
                 print(f"{channel} 号结果：{result['state']}。{result['message']}")
                 print(f"{channel} 号当前开度：{gripper.get_width(channel):.3f}")
+        finally:
+            gripper.disconnect()
     except GripperError as exc:
         print(f"操作失败：{exc}")
 

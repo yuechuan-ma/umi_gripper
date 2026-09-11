@@ -21,7 +21,7 @@ from scservo_sdk import (
     sms_sts,
 )
 
-STEPS_PER_TURN, MAX_MULTI_TURN_STEPS = 4096, 28672
+STEPS_PER_TURN = 4096
 DEFAULT_BAUDRATES = (1_000_000, 500_000, 250_000, 115_200, 57_600, 38_400)
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("gripper_config.json")
 
@@ -61,7 +61,6 @@ def default_servo_config(selected: dict | None = None) -> dict:
         "open_position_steps": None,
         "speed": 1200,
         "grip_strength": 50,
-        "control_frequency_hz": 20,
         "status_frequency_hz": 50,
         "calibration_step_steps": 128,
         "motion_timeout_s": 30,
@@ -101,7 +100,6 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
         "baudrate",
         "speed",
         "grip_strength",
-        "control_frequency_hz",
         "status_frequency_hz",
         "calibration_step_steps",
         "motion_timeout_s",
@@ -115,9 +113,7 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
     _integer(config, "baudrate", 9600, 1_000_000)
     _integer(config, "speed", 1, 3400)
     _integer(config, "grip_strength", 1, 100)
-    control = _integer(config, "control_frequency_hz", 1, 100)
-    if _integer(config, "status_frequency_hz", 1, 100) < control:
-        raise ConfigError(f"{channel} 号舵机状态频率不能低于控制频率。")
+    _integer(config, "status_frequency_hz", 1, 100)
     _integer(config, "calibration_step_steps", 10, 1024)
     _integer(config, "motion_timeout_s", 2, 120)
     load, current = config.get("contact_load_threshold"), config.get(
@@ -135,11 +131,15 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
         "neutral_position_steps",
         "open_position_steps",
     ):
-        _integer(config, key, -MAX_MULTI_TURN_STEPS, MAX_MULTI_TURN_STEPS)
-    if config["closed_position_steps"] != 0:
-        raise ConfigError(f"{channel} 号舵机闭合参考位置必须为 0。")
+        _integer(config, key, 0, STEPS_PER_TURN - 1)
     opened, neutral = config["open_position_steps"], config["neutral_position_steps"]
-    if abs(opened) < 10 or opened * neutral < 0 or abs(neutral) > abs(opened):
+    span = opened - config["closed_position_steps"]
+    neutral_delta = neutral - config["closed_position_steps"]
+    if (
+        not 10 <= abs(span) < STEPS_PER_TURN // 2
+        or neutral_delta * span < 0
+        or abs(neutral_delta) > abs(span)
+    ):
         raise ConfigError(f"{channel} 号舵机标定位置不合理。")
 
 
@@ -161,11 +161,6 @@ def validate_config(config: dict, *, calibrated: bool = True) -> None:
         ):
             raise ConfigError("同一串口上的两个舵机必须使用相同波特率。")
         ports[item["serial_port"]] = item["baudrate"]
-
-
-def _raw_delta(previous: int, current: int) -> int:
-    delta = (current - previous) % STEPS_PER_TURN
-    return delta - STEPS_PER_TURN if delta > STEPS_PER_TURN // 2 else delta
 
 
 class ServoBus:
@@ -229,18 +224,27 @@ class ServoBus:
         self._check(result, error, f"确认 ID {sid} 舵机")
         return model
 
-    def configure_speed_mode(self, sid: int) -> None:
+    def configure_position_mode(self, sid: int) -> None:
         self._write1(sid, SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
         self._write1(sid, 55, 0, "解锁舵机设置")
         self._write2(sid, 9, 0, "设置最小角度")
-        self._write2(sid, 11, 0, "设置最大角度")
-        self._write1(sid, 33, 1, "切换多圈速度模式")
+        self._write2(sid, 11, STEPS_PER_TURN - 1, "设置最大角度")
+        self._write1(sid, 33, 0, "切换绝对位置模式")
         self._write1(sid, 55, 1, "锁定舵机设置")
 
-    def check_speed_mode(self, sid: int) -> None:
-        if self._read1(sid, 33, "读取舵机模式") != 1:
+    def set_current_position_as_middle(self, sid: int) -> None:
+        """使用舵机的置中指令，将当前安装角度设为 2048。"""
+        self._write1(sid, SMS_STS_TORQUE_ENABLE, 128, "将当前位置设为中位")
+        time.sleep(0.05)
+        position, result, error = self.packet.ReadPos(sid)
+        self._check(result, error, "确认中位设置")
+        if not 2044 <= position <= 2052:
+            raise GripperError("舵机未能将当前位置设为中位，请检查舵机型号和通信。")
+
+    def check_position_mode(self, sid: int) -> None:
+        if self._read1(sid, 33, "读取舵机模式") != 0:
             raise GripperError(
-                f"ID {sid} 舵机未处于多圈速度模式，请先运行 gripper_init.py。"
+                f"ID {sid} 舵机未处于绝对位置模式，请先运行 gripper_cal.py。"
             )
 
     def prepare(self, sid: int, strength: int) -> None:
@@ -253,9 +257,9 @@ class ServoBus:
         self._write1(new_id, 55, 1, "锁定舵机设置")
         self.verify(new_id)
 
-    def set_speed(self, sid: int, speed: int) -> None:
-        result, error = self.packet.WriteSpec(sid, speed, 50)
-        self._check(result, error, "下发转速")
+    def set_position(self, sid: int, position: int, speed: int) -> None:
+        result, error = self.packet.WritePosEx(sid, position, speed, 50)
+        self._check(result, error, "下发目标位置")
 
     def telemetry(self, sid: int) -> dict:
         position, result, error = self.packet.ReadPos(sid)
@@ -340,15 +344,14 @@ class _Channel:
     config: dict
     bus: ServoBus
     calibrated: bool
-    raw_previous: int | None = None
-    steps: int = 0
-    homed: bool = False
+    position: int | None = None
+    position_valid: bool = False
     target: int | None = None
     target_speed: int | None = None
     version: int = 0
     blocked_direction: str | None = None
     blocked_samples: int = 0
-    last_command: float = 0
+    sent_version: int | None = None
     stop_pending: bool = False
     stop_version: int = 0
     stop_result: tuple = ("就绪", "", None)
@@ -396,16 +399,16 @@ class Gripper:
             for item in self.channels.values():
                 sid = item.config["servo_id"]
                 item.bus.verify(sid)
-                item.bus.check_speed_mode(sid)
+                item.bus.check_position_mode(sid)
                 item.bus.prepare(sid, item.config["grip_strength"])
                 item.stopped.set()
                 item.state = {
-                    "state": "未回零",
+                    "state": "正在读取当前位置",
                     "blocked_direction": None,
                     "target_width": None,
                     "width": None,
                     "telemetry": None,
-                    "message": "请先使用 W/S 回到闭合参考位置，并按回车确认。",
+                    "message": "正在读取单圈绝对位置。",
                 }
         except Exception:
             for bus in self.buses.values():
@@ -418,9 +421,10 @@ class Gripper:
         return self
 
     def __exit__(self, *_):
-        self.close()
+        self.disconnect()
 
-    def close(self):
+    def disconnect(self):
+        """停止后台更新并关闭串口；可重复调用。"""
         if not self.stop_event.is_set():
             for item in self.channels.values():
                 self._request_stop(item, "已停止", "夹爪已停止。")
@@ -430,6 +434,10 @@ class Gripper:
         self.worker.join(timeout=1)
         for bus in self.buses.values():
             bus.close()
+
+    def close(self):
+        """兼容旧名称；请优先使用 disconnect()。"""
+        self.disconnect()
 
     def _channel(self, channel):
         if channel is None:
@@ -443,8 +451,28 @@ class Gripper:
         return self.channels[channel]
 
     @staticmethod
-    def _width(item, steps):
-        return max(0.0, min(1.0, steps / item.config["open_position_steps"]))
+    def _width(item, position):
+        closed = item.config["closed_position_steps"]
+        span = item.config["open_position_steps"] - closed
+        return max(0.0, min(1.0, (position - closed) / span))
+
+    @staticmethod
+    def _position_is_valid(item, position):
+        closed = item.config["closed_position_steps"]
+        span = item.config["open_position_steps"] - closed
+        offset = position - closed
+        return offset * span >= 0 and abs(offset) <= abs(span)
+
+    @staticmethod
+    def _direction(item, start, end):
+        delta = end - start
+        if not item.calibrated:
+            return "正向" if delta > 0 else "反向"
+        span = (
+            item.config["open_position_steps"]
+            - item.config["closed_position_steps"]
+        )
+        return "张开" if delta * span > 0 else "闭合"
 
     @staticmethod
     def _thresholds(item):
@@ -462,15 +490,19 @@ class Gripper:
 
     def get_width(self, channel=None):
         item = self._channel(channel)
-        if not item.homed or not item.calibrated:
-            raise GripperError(f"{item.index} 号舵机尚未回零或标定。")
-        return self._width(item, item.steps)
+        if not item.calibrated or item.position is None:
+            raise GripperError(f"{item.index} 号舵机尚未得到有效的当前位置。")
+        if not item.position_valid:
+            raise GripperError(f"{item.index} 号舵机当前位置位于标定范围之外。")
+        return self._width(item, item.position)
 
     def _request_stop(self, item, state, message, *, blocked_direction=None):
         with self.lock:
             item.version += 1
-            item.target = item.target_speed = None
+            item.target = None
+            item.target_speed = None
             item.blocked_samples = 0
+            item.sent_version = None
             item.stop_pending, item.stop_version, item.stop_result = (
                 True,
                 item.version,
@@ -501,18 +533,20 @@ class Gripper:
 
     def _set_target(self, item, target, label=None, speed=None):
         with self.lock:
-            direction = (
-                "opening"
-                if (target - item.steps) * (item.config.get("open_position_steps") or 1)
-                > 0
-                else "closing"
-            )
-            if item.blocked_direction == direction and abs(target - item.steps) > 12:
+            if item.position is None or not item.position_valid:
+                raise GripperError(f"{item.index} 号舵机当前位置无效，拒绝运动。")
+            direction = self._direction(item, item.position, target)
+            if (
+                item.blocked_direction == direction
+                and abs(item.position - target) > 12
+            ):
                 return False
             if item.blocked_direction != direction:
                 item.blocked_direction = None
             item.version += 1
-            item.target, item.target_speed, item.blocked_samples = target, speed, 0
+            item.target = target
+            item.target_speed = speed or item.config["speed"]
+            item.blocked_samples, item.sent_version = 0, None
             item.state.update(
                 state="运动中",
                 blocked_direction=None,
@@ -521,36 +555,27 @@ class Gripper:
             )
             return True
 
-    @staticmethod
-    def _motion_speed(item, remaining, maximum):
-        slow = max(80, round(maximum / item.config["control_frequency_hz"] * 4))
-        if remaining >= slow:
-            return maximum
-        return max(
-            min(maximum, max(30, min(150, maximum // 10))),
-            round(maximum * remaining / slow),
-        )
-
-    def _update(self, item, now):
+    def _update(self, item):
         try:
             t = item.bus.telemetry(item.config["servo_id"])
             with self.lock:
-                if item.raw_previous is None:
-                    item.raw_previous = t["raw_position"]
-                else:
-                    item.steps += _raw_delta(item.raw_previous, t["raw_position"])
-                    item.raw_previous = t["raw_position"]
-                steps, target, version, pending, stop_version = (
-                    item.steps,
+                item.position = t["raw_position"]
+                item.position_valid = (
+                    not item.calibrated
+                    or self._position_is_valid(item, item.position)
+                )
+                position, target, target_speed, version, pending, stop_version = (
+                    item.position,
                     item.target,
+                    item.target_speed,
                     item.version,
                     item.stop_pending,
                     item.stop_version,
                 )
                 item.state.update(
                     width=(
-                        self._width(item, steps)
-                        if item.homed and item.calibrated
+                        self._width(item, position)
+                        if item.calibrated and item.position_valid
                         else None
                     ),
                     telemetry=t,
@@ -565,8 +590,18 @@ class Gripper:
                         item.test_samples
                         + [{"load": abs(t["load"]), "current_ma": abs(t["current_ma"])}]
                     )[-25:]
+            if not item.position_valid:
+                with self.lock:
+                    item.target = item.target_speed = None
+                    item.state.update(
+                        state="异常",
+                        message="当前位置位于标定范围之外；请运行 gripper_cal.py 重新标定。",
+                    )
+                return
             if pending:
-                item.bus.set_speed(item.config["servo_id"], 0)
+                item.bus.set_position(
+                    item.config["servo_id"], position, item.config["speed"]
+                )
                 self._finish_stop(item, stop_version)
                 return
             if t["temperature_c"] >= 70:
@@ -574,17 +609,13 @@ class Gripper:
                 return
             if target is None:
                 return
-            direction = (
-                "opening"
-                if (target - steps) * (item.config.get("open_position_steps") or 1) > 0
-                else "closing"
-            )
+            direction = self._direction(item, position, target)
             high = (
                 abs(t["load"]) >= self._thresholds(item)[0]
                 and abs(t["current_ma"]) >= self._thresholds(item)[1]
             )
             item.blocked_samples = item.blocked_samples + 1 if high else 0
-            remaining = abs(target - steps)
+            remaining = abs(position - target)
             if item.blocked_samples >= 3:
                 item.blocked_direction = direction
                 self._request_stop(
@@ -595,14 +626,9 @@ class Gripper:
                 )
             elif remaining <= 12:
                 self._request_stop(item, "已到位", "已到达目标位置。")
-            elif now - item.last_command >= 1 / item.config["control_frequency_hz"]:
-                speed = self._motion_speed(
-                    item, remaining, item.target_speed or item.config["speed"]
-                )
-                item.bus.set_speed(
-                    item.config["servo_id"], speed if target > steps else -speed
-                )
-                item.last_command = now
+            elif item.sent_version != version:
+                item.bus.set_position(item.config["servo_id"], target, target_speed)
+                item.sent_version = version
                 if item.test_active and item.test_version == version:
                     item.test_collecting = True
                 item.state.update(
@@ -620,7 +646,7 @@ class Gripper:
             now, next_due = time.monotonic(), time.monotonic() + 0.05
             for item in self.channels.values():
                 if now >= item.next_status:
-                    self._update(item, now)
+                    self._update(item)
                     item.next_status = now + 1 / item.config["status_frequency_hz"]
                 next_due = min(next_due, item.next_status)
             self.stop_event.wait(max(0.001, next_due - time.monotonic()))
@@ -629,10 +655,12 @@ class Gripper:
         if not isinstance(width, (int, float)) or not 0 <= float(width) <= 1:
             raise ValueError("goto() 的取值必须在 0 到 1 之间。")
         item = self._channel(channel)
-        if not item.homed or not item.calibrated:
-            raise GripperError(f"{item.index} 号舵机请先调用 home()。")
+        if not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机尚未完成标定。")
+        closed = item.config["closed_position_steps"]
+        span = item.config["open_position_steps"] - closed
         self._set_target(
-            item, round(item.config["open_position_steps"] * float(width)), float(width)
+            item, closed + round(span * float(width)), float(width)
         )
 
     def wait(self, timeout=None, channel=None):
@@ -640,15 +668,15 @@ class Gripper:
         deadline = time.monotonic() + (timeout or item.config["motion_timeout_s"])
         while time.monotonic() < deadline:
             result = self.get_state(item.index)
-            if result["state"] not in {"运动中", "停止中", "未回零"}:
+            if result["state"] not in {"运动中", "停止中", "正在读取当前位置"}:
                 return result
             time.sleep(0.02)
         raise GripperError(f"{item.index} 号舵机等待动作完成超时。")
 
     def reset(self, channel=None):
         item = self._channel(channel)
-        if not item.homed or not item.calibrated:
-            raise GripperError(f"{item.index} 号舵机请先调用 home()。")
+        if not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机尚未完成标定。")
         self._set_target(
             item,
             item.config["neutral_position_steps"],
@@ -664,7 +692,10 @@ class Gripper:
         item = self._channel(channel)
         ok = self._set_target(
             item,
-            item.steps + direction * item.config["calibration_step_steps"],
+            min(
+                STEPS_PER_TURN - 1,
+                max(0, item.position + direction * item.config["calibration_step_steps"]),
+            ),
             speed=min(item.config["speed"], 300),
         )
         if ok and item.test_active:
@@ -673,23 +704,23 @@ class Gripper:
             item.test_collecting = False
         return ok
 
-    def _keyboard(self, item, name, home):
+    def _keyboard(self, item, name):
         with _KeyReader() as reader:
             while True:
                 key = reader.read().lower()
                 if key in {"w", "s"}:
-                    if not self.manual_step(1 if key == "w" else -1, item.index):
+                    try:
+                        moved = self.manual_step(1 if key == "w" else -1, item.index)
+                    except GripperError as exc:
+                        print(str(exc))
+                        continue
+                    if not moved:
                         print(
                             "该方向刚检测到阻塞；请改按相反方向，或按回车确认当前位置。"
                         )
                 elif key in {"\r", "\n"}:
                     self._request_stop(item, "就绪", "已停止在当前位置。")
                     item.stopped.wait(1)
-                    if home:
-                        item.steps, item.homed, item.blocked_direction = 0, True, None
-                        item.state.update(
-                            state="就绪", width=0.0, message="已确认闭合参考位置。"
-                        )
                     print(f"已确认{name}。\n")
                     return True
                 elif key == "q":
@@ -698,23 +729,21 @@ class Gripper:
                     print("已取消。\n")
                     return False
 
-    def home(self, channel=None):
-        item = self._channel(channel)
-        print(
-            f"\n{item.index} 号舵机回零：W/S 控制移动。到闭合参考位置后按回车；Q 退出。"
-        )
-        return self._keyboard(item, "闭合参考位置", True)
-
     def calibrate_position(self, name, channel=None):
         item = self._channel(channel)
         print(f"\n标定 {item.index} 号舵机{name}：W/S 控制移动。到位后按回车；Q 退出。")
-        return item.steps if self._keyboard(item, name, False) else None
+        return item.position if self._keyboard(item, name) else None
 
     def guided_grip_test(self, channel=None):
         item = self._channel(channel)
-        if not item.homed or not item.calibrated:
+        if not item.calibrated:
             raise GripperError("请先完成闭合、中立和张开位置标定。")
-        close = -1 if item.config["open_position_steps"] > 0 else 1
+        close = (
+            -1
+            if item.config["open_position_steps"]
+            > item.config["closed_position_steps"]
+            else 1
+        )
         close_key, open_key = ("S", "W") if close < 0 else ("W", "S")
         print(
             f"\n{item.index} 号舵机可选夹紧测试：放入测试物。{close_key} 闭合、{open_key} 张开；回车记录，Q 跳过。"

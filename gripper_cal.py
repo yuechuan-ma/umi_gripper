@@ -65,7 +65,7 @@ def optional_grip_test(gripper, config, channel):
         print("已保存夹紧判定值。")
 
 
-def configure_speed_mode(config):
+def configure_position_mode(config):
     buses = {}
     try:
         for item in config["servos"]:
@@ -79,9 +79,9 @@ def configure_speed_mode(config):
             bus.open()
         for item in config["servos"]:
             if item is not None:
-                buses[(item["serial_port"], item["baudrate"])].configure_speed_mode(
-                    item["servo_id"]
-                )
+                bus = buses[(item["serial_port"], item["baudrate"])]
+                bus.configure_position_mode(item["servo_id"])
+                bus.set_current_position_as_middle(item["servo_id"])
     finally:
         for bus in buses.values():
             bus.close()
@@ -111,31 +111,33 @@ def main():
     }
     try:
         validate_config(config, calibrated=False)
-        configure_speed_mode(config)
+        configure_position_mode(config)
         with Gripper(config=config, allow_uninitialized=True) as gripper:
-            print("已切换为多圈速度模式。每个通道依次使用 W/S 标定。")
+            print(
+                "已切换为单圈绝对位置模式，并将各舵机当前安装角度设为中位。"
+                "每个通道依次使用 W/S 标定。"
+            )
             for channel, item in enumerate(config["servos"]):
                 if item is None:
                     continue
-                if not gripper.home(channel):
+                closed = gripper.calibrate_position("闭合位置", channel)
+                if closed is None:
                     return
-                item["closed_position_steps"] = 0
                 neutral = gripper.calibrate_position("中立位置", channel)
                 if neutral is None:
                     return
                 opened = gripper.calibrate_position("张开位置", channel)
                 if opened is None:
                     return
-                item["neutral_position_steps"], item["open_position_steps"] = (
-                    neutral,
-                    opened,
-                )
+                item["closed_position_steps"] = closed
+                item["neutral_position_steps"] = neutral
+                item["open_position_steps"] = opened
                 gripper.channels[channel].config.update(item)
                 gripper.channels[channel].calibrated = True
                 optional_grip_test(gripper, item, channel)
             validate_config(config)
         save_config(config)
-        print("标定完成并已保存。之后创建 Gripper 对象时，各通道都必须先调用 home()。")
+        print("标定完成并已保存。之后创建 Gripper 对象会直接读取当前位置。")
     except GripperError as exc:
         print(f"初始化失败：{exc}")
 
