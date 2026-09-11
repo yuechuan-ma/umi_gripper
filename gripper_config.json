@@ -1,17 +1,38 @@
 {
-  "serial_port": "/dev/ttyACM2",
-  "servo_id": 5,
-  "baudrate": 1000000,
-  "servo_model_number": 777,
-  "closed_position_steps": 0,
-  "neutral_position_steps": 1726,
-  "open_position_steps": 4079,
-  "speed": 1200,
-  "grip_strength": 50,
-  "control_frequency_hz": 20,
-  "status_frequency_hz": 50,
-  "calibration_step_steps": 128,
-  "motion_timeout_s": 30,
-  "contact_load_threshold": null,
-  "contact_current_ma": null
+  "servos": [
+    {
+      "serial_port": "COM3",
+      "servo_id": 5,
+      "baudrate": 1000000,
+      "servo_model_number": 777,
+      "closed_position_steps": 0,
+      "neutral_position_steps": 1917,
+      "open_position_steps": 4991,
+      "speed": 1200,
+      "grip_strength": 50,
+      "control_frequency_hz": 20,
+      "status_frequency_hz": 50,
+      "calibration_step_steps": 128,
+      "motion_timeout_s": 30,
+      "contact_load_threshold": null,
+      "contact_current_ma": null
+    },
+    {
+      "serial_port": "COM3",
+      "servo_id": 6,
+      "baudrate": 1000000,
+      "servo_model_number": 777,
+      "closed_position_steps": 0,
+      "neutral_position_steps": 905,
+      "open_position_steps": 4178,
+      "speed": 1200,
+      "grip_strength": 50,
+      "control_frequency_hz": 20,
+      "status_frequency_hz": 50,
+      "calibration_step_steps": 128,
+      "motion_timeout_s": 30,
+      "contact_load_threshold": null,
+      "contact_current_ma": null
+    }
+  ]
 }

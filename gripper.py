@@ -1,4 +1,4 @@
-"""支持多圈传动、单后台循环的单舵机夹爪控制。"""
+"""支持一至两个独立通道的总线舵机夹爪控制。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from serial.tools import list_ports
@@ -48,6 +49,27 @@ def save_config(config: dict, path: str | Path = DEFAULT_CONFIG_PATH) -> None:
     )
 
 
+def default_servo_config(selected: dict | None = None) -> dict:
+    selected = selected or {}
+    return {
+        "serial_port": selected.get("port"),
+        "servo_id": selected.get("servo_id"),
+        "baudrate": selected.get("baudrate"),
+        "servo_model_number": selected.get("model"),
+        "closed_position_steps": None,
+        "neutral_position_steps": None,
+        "open_position_steps": None,
+        "speed": 1200,
+        "grip_strength": 50,
+        "control_frequency_hz": 20,
+        "status_frequency_hz": 50,
+        "calibration_step_steps": 128,
+        "motion_timeout_s": 30,
+        "contact_load_threshold": None,
+        "contact_current_ma": None,
+    }
+
+
 def _integer(config: dict, key: str, low: int, high: int) -> int:
     value = config.get(key)
     if (
@@ -59,7 +81,20 @@ def _integer(config: dict, key: str, low: int, high: int) -> int:
     return value
 
 
-def validate_config(config: dict, *, calibrated: bool = True) -> None:
+def _servos(config: dict) -> list[dict | None]:
+    if "servos" not in config:
+        return [dict(config), None]
+    value = config["servos"]
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(x is not None and not isinstance(x, dict) for x in value)
+    ):
+        raise ConfigError("配置项“servos”必须是包含两个配置对象或 null 的列表。")
+    return [dict(x) if x is not None else None for x in value]
+
+
+def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
     required = (
         "serial_port",
         "servo_id",
@@ -73,32 +108,28 @@ def validate_config(config: dict, *, calibrated: bool = True) -> None:
     )
     missing = [key for key in required if config.get(key) in (None, "")]
     if missing:
-        raise ConfigError("配置尚未完成：" + "、".join(missing) + "。")
+        raise ConfigError(f"{channel} 号舵机配置尚未完成：" + "、".join(missing))
     if not isinstance(config["serial_port"], str):
-        raise ConfigError("配置项“serial_port”必须是串口名称。")
-    
+        raise ConfigError(f"{channel} 号舵机串口无效。")
     _integer(config, "servo_id", 0, 253)
     _integer(config, "baudrate", 9600, 1_000_000)
     _integer(config, "speed", 1, 3400)
     _integer(config, "grip_strength", 1, 100)
-
     control = _integer(config, "control_frequency_hz", 1, 100)
     if _integer(config, "status_frequency_hz", 1, 100) < control:
-        raise ConfigError("后台状态频率不能低于控制频率。")
-    
+        raise ConfigError(f"{channel} 号舵机状态频率不能低于控制频率。")
     _integer(config, "calibration_step_steps", 10, 1024)
     _integer(config, "motion_timeout_s", 2, 120)
-
-    load, current = config.get("contact_load_threshold"), config.get("contact_current_ma")
+    load, current = config.get("contact_load_threshold"), config.get(
+        "contact_current_ma"
+    )
     if (load is None) != (current is None):
         raise ConfigError("夹紧阈值必须同时填写，或同时留空。")
     if load is not None:
         _integer(config, "contact_load_threshold", 1, 1000)
         _integer(config, "contact_current_ma", 1, 5000)
-
     if not calibrated:
         return
-    
     for key in (
         "closed_position_steps",
         "neutral_position_steps",
@@ -106,12 +137,30 @@ def validate_config(config: dict, *, calibrated: bool = True) -> None:
     ):
         _integer(config, key, -MAX_MULTI_TURN_STEPS, MAX_MULTI_TURN_STEPS)
     if config["closed_position_steps"] != 0:
-        raise ConfigError("闭合参考位置必须为 0；请重新初始化。")
+        raise ConfigError(f"{channel} 号舵机闭合参考位置必须为 0。")
     opened, neutral = config["open_position_steps"], config["neutral_position_steps"]
-    if abs(opened) < 10:
-        raise ConfigError("张开行程不合理；请重新初始化。")
-    if opened * neutral < 0 or abs(neutral) > abs(opened):
-        raise ConfigError("中立位置必须位于闭合和张开位置之间。")
+    if abs(opened) < 10 or opened * neutral < 0 or abs(neutral) > abs(opened):
+        raise ConfigError(f"{channel} 号舵机标定位置不合理。")
+
+
+def validate_config(config: dict, *, calibrated: bool = True) -> None:
+    servos = _servos(config)
+    active = [(i, x) for i, x in enumerate(servos) if x is not None]
+    if not active:
+        raise ConfigError("至少需要配置一个舵机。")
+    seen, ports = set(), {}
+    for index, item in active:
+        _validate_servo(item, index, calibrated)
+        identity = (item["serial_port"], item["servo_id"])
+        if identity in seen:
+            raise ConfigError("同一串口上的两个舵机 ID 不能相同。")
+        seen.add(identity)
+        if (
+            item["serial_port"] in ports
+            and ports[item["serial_port"]] != item["baudrate"]
+        ):
+            raise ConfigError("同一串口上的两个舵机必须使用相同波特率。")
+        ports[item["serial_port"]] = item["baudrate"]
 
 
 def _raw_delta(previous: int, current: int) -> int:
@@ -120,9 +169,11 @@ def _raw_delta(previous: int, current: int) -> int:
 
 
 class ServoBus:
-    def __init__(self, port: str, servo_id: int, baudrate: int):
-        self.port_name, self.servo_id, self.baudrate = port, servo_id, baudrate
-        self.port, self.packet = PortHandler(port), None
+    """一个物理串口，可供多个不同 ID 的舵机使用。"""
+
+    def __init__(self, port: str, baudrate: int):
+        self.port_name, self.baudrate = port, baudrate
+        self.port, self.packet, self.opened = PortHandler(port), None, False
 
     @staticmethod
     def _check(result: int, error: int, action: str) -> None:
@@ -132,19 +183,21 @@ class ServoBus:
             raise GripperError(f"{action}失败：舵机报告异常（代码 {error}）。")
 
     def open(self) -> None:
-        if not self.port.openPort():
-            raise GripperError(
-                f"无法打开串口 {self.port_name}。请确认设备已连接且未被占用。"
-            )
+        try:
+            self.opened = self.port.openPort()
+        except Exception as exc:
+            raise GripperError(f"无法打开串口 {self.port_name}：{exc}") from exc
+        if not self.opened:
+            raise GripperError(f"无法打开串口 {self.port_name}。")
         if not self.port.setBaudRate(self.baudrate):
-            self.port.closePort()
+            self.close()
             raise GripperError(f"无法设置串口速度 {self.baudrate}。")
         self.packet = sms_sts(self.port)
-        _, result, error = self.packet.ping(self.servo_id)
-        self._check(result, error, "确认舵机")
 
     def close(self) -> None:
-        self.port.closePort()
+        if self.opened:
+            self.port.closePort()
+            self.opened = False
 
     def __enter__(self):
         self.open()
@@ -153,71 +206,77 @@ class ServoBus:
     def __exit__(self, *_):
         self.close()
 
-    def _read1(self, address: int, action: str) -> int:
-        value, result, error = self.packet.read1ByteTxRx(self.servo_id, address)
+    def _read1(self, sid, address, action):
+        value, result, error = self.packet.read1ByteTxRx(sid, address)
         self._check(result, error, action)
         return value
 
-    def _read2(self, address: int, action: str) -> int:
-        value, result, error = self.packet.read2ByteTxRx(self.servo_id, address)
+    def _read2(self, sid, address, action):
+        value, result, error = self.packet.read2ByteTxRx(sid, address)
         self._check(result, error, action)
         return value
 
-    def _write1(self, address: int, value: int, action: str) -> None:
-        result, error = self.packet.write1ByteTxRx(self.servo_id, address, value)
+    def _write1(self, sid, address, value, action):
+        result, error = self.packet.write1ByteTxRx(sid, address, value)
         self._check(result, error, action)
 
-    def _write2(self, address: int, value: int, action: str) -> None:
-        result, error = self.packet.write2ByteTxRx(self.servo_id, address, value)
+    def _write2(self, sid, address, value, action):
+        result, error = self.packet.write2ByteTxRx(sid, address, value)
         self._check(result, error, action)
 
-    def configure_speed_mode(self) -> None:
-        self._write1(SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
-        self._write1(55, 0, "解锁舵机设置")
-        self._write2(9, 0, "设置最小角度")
-        self._write2(11, 0, "设置最大角度")
-        self._write1(33, 1, "切换多圈速度模式")
-        self._write1(55, 1, "锁定舵机设置")
+    def verify(self, sid: int) -> int:
+        model, result, error = self.packet.ping(sid)
+        self._check(result, error, f"确认 ID {sid} 舵机")
+        return model
 
-    def check_speed_mode(self) -> None:
-        if self._read1(33, "读取舵机模式") != 1:
-            raise GripperError("舵机未处于多圈速度模式。请先运行 gripper_init.py。")
+    def configure_speed_mode(self, sid: int) -> None:
+        self._write1(sid, SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
+        self._write1(sid, 55, 0, "解锁舵机设置")
+        self._write2(sid, 9, 0, "设置最小角度")
+        self._write2(sid, 11, 0, "设置最大角度")
+        self._write1(sid, 33, 1, "切换多圈速度模式")
+        self._write1(sid, 55, 1, "锁定舵机设置")
 
-    def prepare(self, strength: int) -> None:
-        self._write2(48, strength * 10, "设置夹紧力度")
-        self._write1(SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
+    def check_speed_mode(self, sid: int) -> None:
+        if self._read1(sid, 33, "读取舵机模式") != 1:
+            raise GripperError(
+                f"ID {sid} 舵机未处于多圈速度模式，请先运行 gripper_init.py。"
+            )
 
-    def set_speed(self, speed: int) -> None:
-        """设定有符号转速；速度为 0 是明确停止命令。"""
-        result, error = self.packet.WriteSpec(self.servo_id, speed, 50)
+    def prepare(self, sid: int, strength: int) -> None:
+        self._write2(sid, 48, strength * 10, "设置夹紧力度")
+        self._write1(sid, SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
+
+    def change_id(self, old_id: int, new_id: int) -> None:
+        self._write1(old_id, 55, 0, "解锁舵机设置")
+        self._write1(old_id, 5, new_id, "写入新 ID")
+        self._write1(new_id, 55, 1, "锁定舵机设置")
+        self.verify(new_id)
+
+    def set_speed(self, sid: int, speed: int) -> None:
+        result, error = self.packet.WriteSpec(sid, speed, 50)
         self._check(result, error, "下发转速")
 
-    def stop_motion(self) -> None:
-        self.set_speed(0)
-
-    def telemetry(self) -> dict:
-        position, result, error = self.packet.ReadPos(self.servo_id)
+    def telemetry(self, sid: int) -> dict:
+        position, result, error = self.packet.ReadPos(sid)
         self._check(result, error, "读取当前位置")
-        # 多圈模式下部分固件会返回带圈数的有符号位置；后台自行累计圈数，故只保留单圈余数。
-        position %= STEPS_PER_TURN
-        load = self._read2(SMS_STS_PRESENT_LOAD_L, "读取负载")
-        current = self._read2(SMS_STS_PRESENT_CURRENT_L, "读取电流")
-        temperature = self._read1(SMS_STS_PRESENT_TEMPERATURE, "读取温度")
+        load = self._read2(sid, SMS_STS_PRESENT_LOAD_L, "读取负载")
+        current = self._read2(sid, SMS_STS_PRESENT_CURRENT_L, "读取电流")
+        temp = self._read1(sid, SMS_STS_PRESENT_TEMPERATURE, "读取温度")
         load = -(load & ~(1 << 10)) if load & (1 << 10) else load
         current = -(current & ~(1 << 15)) if current & (1 << 15) else current
         return {
-            "raw_position": position,
+            "raw_position": position % STEPS_PER_TURN,
             "load": load,
             "current_ma": round(current * 6.5),
-            "temperature_c": temperature,
+            "temperature_c": temp,
         }
 
 
 def _scan(baudrates: tuple[int, ...]) -> list[dict]:
     found = []
     for info in list_ports.comports():
-        handler = PortHandler(info.device)
-        opened = False
+        handler, opened = PortHandler(info.device), False
         try:
             try:
                 opened = handler.openPort()
@@ -229,13 +288,13 @@ def _scan(baudrates: tuple[int, ...]) -> list[dict]:
             for baudrate in baudrates:
                 if not handler.setBaudRate(baudrate):
                     continue
-                for servo_id in range(254):
-                    model, result, error = packet.ping(servo_id)
+                for sid in range(254):
+                    model, result, error = packet.ping(sid)
                     if result == COMM_SUCCESS and not error:
                         found.append(
                             {
                                 "port": info.device,
-                                "servo_id": servo_id,
+                                "servo_id": sid,
                                 "baudrate": baudrate,
                                 "model": model,
                             }
@@ -275,54 +334,83 @@ class _KeyReader:
             self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.settings)
 
 
-class Gripper:
-    """创建后调用 home()；goto() 只更新目标，所有串口收发均由后台循环完成。"""
+@dataclass
+class _Channel:
+    index: int
+    config: dict
+    bus: ServoBus
+    calibrated: bool
+    raw_previous: int | None = None
+    steps: int = 0
+    homed: bool = False
+    target: int | None = None
+    target_speed: int | None = None
+    version: int = 0
+    blocked_direction: str | None = None
+    blocked_samples: int = 0
+    last_command: float = 0
+    stop_pending: bool = False
+    stop_version: int = 0
+    stop_result: tuple = ("就绪", "", None)
+    stopped: threading.Event = field(default_factory=threading.Event)
+    state: dict = field(default_factory=dict)
+    next_status: float = 0
+    test_active: bool = False
+    test_collecting: bool = False
+    test_version: int | None = None
+    test_samples: list = field(default_factory=list)
 
+
+class Gripper:
     def __init__(
         self,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
         config: dict | None = None,
-        allow_uninitialized: bool = False,
+        allow_uninitialized=False,
     ):
         self.config_path = Path(config_path)
-        self.config = (
-            dict(config) if config is not None else _read_json(self.config_path)
-        )
-
-        validate_config(self.config, calibrated=not allow_uninitialized)
-        self.calibrated = self.config.get("open_position_steps") is not None
-
-        self.bus = ServoBus(
-            self.config["serial_port"], self.config["servo_id"], self.config["baudrate"]
-        )
-        self.bus.open()
-        self.bus.check_speed_mode()
-        self.bus.prepare(self.config["grip_strength"])
-
-        self.lock, self.stop_event = threading.RLock(), threading.Event()
-        self.motion_stopped = threading.Event()
-        self.motion_stopped.set()
-
-        self.raw_previous, self.steps, self.homed = None, 0, False
-        self.target, self.target_speed, self.command_version = None, None, 0
-        self.blocked_direction, self.blocked_samples, self.last_command = None, 0, 0.0
-        self.stop_pending, self.stop_version, self.stop_result = False, 0, None
-
-        self.grip_test_active = False
-        self.grip_test_samples = []
-        self.grip_test_version = None
-        self.grip_test_collecting = False
-
-        self.state = {
-            "state": "未回零",
-            "blocked_direction": None,
-            "target_width": None,
-            "width": None,
-            "telemetry": None,
-            "message": "请先使用 W/S 回到闭合参考位置，并按回车确认。",
+        self.config = {
+            "servos": _servos(
+                config if config is not None else _read_json(self.config_path)
+            )
         }
-
+        validate_config(self.config, calibrated=not allow_uninitialized)
+        self.lock, self.stop_event, self.buses, self.channels = (
+            threading.RLock(),
+            threading.Event(),
+            {},
+            {},
+        )
+        try:
+            for index, item in enumerate(self.config["servos"]):
+                if item is None:
+                    continue
+                key = (item["serial_port"], item["baudrate"])
+                bus = self.buses.setdefault(key, ServoBus(*key))
+                self.channels[index] = _Channel(
+                    index, item, bus, item.get("open_position_steps") is not None
+                )
+            for bus in self.buses.values():
+                bus.open()
+            for item in self.channels.values():
+                sid = item.config["servo_id"]
+                item.bus.verify(sid)
+                item.bus.check_speed_mode(sid)
+                item.bus.prepare(sid, item.config["grip_strength"])
+                item.stopped.set()
+                item.state = {
+                    "state": "未回零",
+                    "blocked_direction": None,
+                    "target_width": None,
+                    "width": None,
+                    "telemetry": None,
+                    "message": "请先使用 W/S 回到闭合参考位置，并按回车确认。",
+                }
+        except Exception:
+            for bus in self.buses.values():
+                bus.close()
+            raise
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
@@ -332,213 +420,100 @@ class Gripper:
     def __exit__(self, *_):
         self.close()
 
-    def close(self) -> None:
+    def close(self):
         if not self.stop_event.is_set():
-            self._request_stop("已停止", "夹爪已停止。")
-            self.motion_stopped.wait(0.5)
+            for item in self.channels.values():
+                self._request_stop(item, "已停止", "夹爪已停止。")
+            for item in self.channels.values():
+                item.stopped.wait(0.5)
         self.stop_event.set()
         self.worker.join(timeout=1)
-        self.bus.close()
+        for bus in self.buses.values():
+            bus.close()
 
-    def _set_state(self, **changes):
+    def _channel(self, channel):
+        if channel is None:
+            if len(self.channels) == 1:
+                return next(iter(self.channels.values()))
+            raise GripperError("已配置多个舵机；请明确指定通道号 0 或 1。")
+        if isinstance(channel, bool) or channel not in (0, 1):
+            raise GripperError("通道号必须是 0 或 1。")
+        if channel not in self.channels:
+            raise GripperError(f"{channel} 号舵机未配置或不存在。")
+        return self.channels[channel]
+
+    @staticmethod
+    def _width(item, steps):
+        return max(0.0, min(1.0, steps / item.config["open_position_steps"]))
+
+    @staticmethod
+    def _thresholds(item):
+        c = item.config
+        return (
+            (c["contact_load_threshold"], c["contact_current_ma"])
+            if c.get("contact_load_threshold") is not None
+            else (max(80, c["grip_strength"] * 6), 200 + c["grip_strength"] * 10)
+        )
+
+    def get_state(self, channel=None):
+        item = self._channel(channel)
         with self.lock:
-            self.state.update(changes)
+            return dict(item.state)
 
-    def get_state(self) -> dict:
+    def get_width(self, channel=None):
+        item = self._channel(channel)
+        if not item.homed or not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机尚未回零或标定。")
+        return self._width(item, item.steps)
+
+    def _request_stop(self, item, state, message, *, blocked_direction=None):
         with self.lock:
-            return dict(self.state)
-
-    def _thresholds(self):
-        if self.config.get("contact_load_threshold") is not None:
-            return (
-                self.config["contact_load_threshold"],
-                self.config["contact_current_ma"],
+            item.version += 1
+            item.target = item.target_speed = None
+            item.blocked_samples = 0
+            item.stop_pending, item.stop_version, item.stop_result = (
+                True,
+                item.version,
+                (state, message, blocked_direction),
             )
-
-        # 以下为人工设定的保守赋值
-        strength = self.config["grip_strength"]
-        return max(80, strength * 6), 200 + strength * 10
-
-    def _width(self, steps: int) -> float:
-        return max(0.0, min(1.0, steps / self.config["open_position_steps"]))
-
-    def get_width(self) -> float:
-        with self.lock:
-            if not self.homed or not self.calibrated:
-                raise GripperError("尚未回零或标定，无法获取夹爪宽度。")
-            return self._width(self.steps)
-
-    def _request_stop(
-        self, state: str, message: str, *, blocked_direction: str | None = None
-    ) -> None:
-        """请求后台发送零速度；调用方不直接操作串口。"""
-        with self.lock:
-            self.command_version += 1
-            self.target, self.target_speed, self.blocked_samples = None, None, 0
-            self.stop_pending, self.stop_version = True, self.command_version
-            self.stop_result = (state, message, blocked_direction)
-            self.motion_stopped.clear()
-            self.state.update(
+            item.stopped.clear()
+            item.state.update(
                 state="停止中",
                 blocked_direction=blocked_direction,
                 target_width=None,
                 message="正在停止舵机。",
             )
 
-    def _finish_stop(self, version: int) -> None:
+    def _finish_stop(self, item, version):
         with self.lock:
-            if not self.stop_pending or self.stop_version != version:
+            if not item.stop_pending or item.stop_version != version:
                 return
-            self.stop_pending = False
-            state, message, blocked_direction = self.stop_result
-            if self.command_version == version:
-                self.state.update(
+            item.stop_pending = False
+            if item.version == version:
+                state, message, blocked = item.stop_result
+                item.state.update(
                     state=state,
-                    blocked_direction=blocked_direction,
+                    blocked_direction=blocked,
                     target_width=None,
                     message=message,
                 )
-            self.motion_stopped.set()
+            item.stopped.set()
 
-    def _wait_stopped(self, timeout: float = 1.0) -> None:
-        if not self.motion_stopped.wait(timeout):
-            raise GripperError(
-                "停止命令未能在 1 秒内确认发送；请立即断开舵机外部电源。"
-            )
-
-    def _motion_speed(self, remaining_steps: int, maximum_speed: int) -> int:
-        """离目标越近，速度越低，避免越过目标后反复修正。"""
-        slowdown_distance = max(
-            80,
-            round(maximum_speed / self.config["control_frequency_hz"] * 4),
-        )
-        if remaining_steps >= slowdown_distance:
-            return maximum_speed
-        minimum_speed = min(maximum_speed, max(30, min(150, maximum_speed // 10)))
-        return max(
-            minimum_speed,
-            round(maximum_speed * remaining_steps / slowdown_distance),
-        )
-
-    def _run(self) -> None:
-        interval, command_interval = (
-            1 / self.config["status_frequency_hz"],
-            1 / self.config["control_frequency_hz"],
-        )
-        load_limit, current_limit = self._thresholds()
-        while not self.stop_event.is_set():
-            started = time.monotonic()
-            try:
-                telemetry = self.bus.telemetry()
-                with self.lock:
-                    raw = telemetry["raw_position"]
-                    if self.raw_previous is None:
-                        self.raw_previous = raw
-                    else:
-                        self.steps += _raw_delta(self.raw_previous, raw)
-                        self.raw_previous = raw
-                    steps, target, target_speed, homed, version = (
-                        self.steps,
-                        self.target,
-                        self.target_speed,
-                        self.homed,
-                        self.command_version,
-                    )
-                    stop_pending, stop_version = self.stop_pending, self.stop_version
-                    if (
-                        self.grip_test_active
-                        and self.grip_test_collecting
-                        and self.grip_test_version == version
-                        and target is not None
-                    ):
-                        self.grip_test_samples.append(
-                            {
-                                "load": abs(telemetry["load"]),
-                                "current_ma": abs(telemetry["current_ma"]),
-                            }
-                        )
-                        self.grip_test_samples = self.grip_test_samples[-25:]
-                width = self._width(steps) if homed and self.calibrated else None
-                self._set_state(width=width, telemetry=telemetry)
-                if stop_pending:
-                    self.bus.stop_motion()
-                    self._finish_stop(stop_version)
-                    continue
-                if telemetry["temperature_c"] >= 70:
-                    self._request_stop("异常", "舵机温度过高，已停止运动。")
-                    continue
-                if target is not None:
-                    with self.lock:
-                        if version != self.command_version:
-                            continue
-                    opening = (target - steps) * (
-                        self.config.get("open_position_steps") or 1
-                    ) > 0
-                    direction = "opening" if opening else "closing"
-                    remaining = abs(target - steps)
-                    high = (
-                        abs(telemetry["load"]) >= load_limit
-                        and abs(telemetry["current_ma"]) >= current_limit
-                    )
-                    self.blocked_samples = self.blocked_samples + 1 if high else 0
-                    if self.blocked_samples >= 3:
-                        with self.lock:
-                            if version != self.command_version:
-                                continue
-                            self.blocked_direction = direction
-                        self._request_stop(
-                            "已阻塞",
-                            f"{direction} 方向检测到物体或物理限位，已停止继续施力。",
-                            blocked_direction=direction,
-                        )
-                    elif remaining <= 12:
-                        with self.lock:
-                            if version != self.command_version:
-                                continue
-                        self._request_stop("已到位", "已到达目标位置。")
-                    elif started - self.last_command >= command_interval:
-                        with self.lock:
-                            if version != self.command_version:
-                                continue
-                        maximum_speed = target_speed or self.config["speed"]
-                        speed = self._motion_speed(remaining, maximum_speed)
-                        self.bus.set_speed(speed if target > steps else -speed)
-                        self.last_command = started
-                        with self.lock:
-                            if (
-                                self.grip_test_active
-                                and self.grip_test_version == version
-                            ):
-                                self.grip_test_collecting = True
-                        self._set_state(
-                            state="运动中", blocked_direction=None, message="正在移动。"
-                        )
-            except GripperError as exc:
-                with self.lock:
-                    self.target, self.target_speed, self.stop_pending = (
-                        None,
-                        None,
-                        False,
-                    )
-                    self.motion_stopped.set()
-                self._set_state(state="异常", message=str(exc))
-            self.stop_event.wait(max(0, interval - (time.monotonic() - started)))
-
-    def _set_target(self, target: int, label=None, *, speed: int | None = None) -> bool:
+    def _set_target(self, item, target, label=None, speed=None):
         with self.lock:
             direction = (
                 "opening"
-                if (target - self.steps) * (self.config.get("open_position_steps") or 1)
+                if (target - item.steps) * (item.config.get("open_position_steps") or 1)
                 > 0
                 else "closing"
             )
-            if self.blocked_direction == direction and abs(target - self.steps) > 12:
+            if item.blocked_direction == direction and abs(target - item.steps) > 12:
                 return False
-            if self.blocked_direction != direction:
-                self.blocked_direction = None
-            self.command_version += 1
-            self.target, self.target_speed, self.blocked_samples = target, speed, 0
-            self.state.update(
+            if item.blocked_direction != direction:
+                item.blocked_direction = None
+            item.version += 1
+            item.target, item.target_speed, item.blocked_samples = target, speed, 0
+            item.state.update(
                 state="运动中",
                 blocked_direction=None,
                 target_width=label,
@@ -546,162 +521,232 @@ class Gripper:
             )
             return True
 
-    def goto(self, width: float) -> None:
+    @staticmethod
+    def _motion_speed(item, remaining, maximum):
+        slow = max(80, round(maximum / item.config["control_frequency_hz"] * 4))
+        if remaining >= slow:
+            return maximum
+        return max(
+            min(maximum, max(30, min(150, maximum // 10))),
+            round(maximum * remaining / slow),
+        )
+
+    def _update(self, item, now):
+        try:
+            t = item.bus.telemetry(item.config["servo_id"])
+            with self.lock:
+                if item.raw_previous is None:
+                    item.raw_previous = t["raw_position"]
+                else:
+                    item.steps += _raw_delta(item.raw_previous, t["raw_position"])
+                    item.raw_previous = t["raw_position"]
+                steps, target, version, pending, stop_version = (
+                    item.steps,
+                    item.target,
+                    item.version,
+                    item.stop_pending,
+                    item.stop_version,
+                )
+                item.state.update(
+                    width=(
+                        self._width(item, steps)
+                        if item.homed and item.calibrated
+                        else None
+                    ),
+                    telemetry=t,
+                )
+                if (
+                    item.test_active
+                    and item.test_collecting
+                    and item.test_version == version
+                    and target is not None
+                ):
+                    item.test_samples = (
+                        item.test_samples
+                        + [{"load": abs(t["load"]), "current_ma": abs(t["current_ma"])}]
+                    )[-25:]
+            if pending:
+                item.bus.set_speed(item.config["servo_id"], 0)
+                self._finish_stop(item, stop_version)
+                return
+            if t["temperature_c"] >= 70:
+                self._request_stop(item, "异常", "舵机温度过高，已停止运动。")
+                return
+            if target is None:
+                return
+            direction = (
+                "opening"
+                if (target - steps) * (item.config.get("open_position_steps") or 1) > 0
+                else "closing"
+            )
+            high = (
+                abs(t["load"]) >= self._thresholds(item)[0]
+                and abs(t["current_ma"]) >= self._thresholds(item)[1]
+            )
+            item.blocked_samples = item.blocked_samples + 1 if high else 0
+            remaining = abs(target - steps)
+            if item.blocked_samples >= 3:
+                item.blocked_direction = direction
+                self._request_stop(
+                    item,
+                    "已阻塞",
+                    f"{direction} 方向检测到物体或物理限位，已停止继续施力。",
+                    blocked_direction=direction,
+                )
+            elif remaining <= 12:
+                self._request_stop(item, "已到位", "已到达目标位置。")
+            elif now - item.last_command >= 1 / item.config["control_frequency_hz"]:
+                speed = self._motion_speed(
+                    item, remaining, item.target_speed or item.config["speed"]
+                )
+                item.bus.set_speed(
+                    item.config["servo_id"], speed if target > steps else -speed
+                )
+                item.last_command = now
+                if item.test_active and item.test_version == version:
+                    item.test_collecting = True
+                item.state.update(
+                    state="运动中", blocked_direction=None, message="正在移动。"
+                )
+        except GripperError as exc:
+            with self.lock:
+                item.target = item.target_speed = None
+                item.stop_pending = False
+                item.stopped.set()
+                item.state.update(state="异常", message=str(exc))
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            now, next_due = time.monotonic(), time.monotonic() + 0.05
+            for item in self.channels.values():
+                if now >= item.next_status:
+                    self._update(item, now)
+                    item.next_status = now + 1 / item.config["status_frequency_hz"]
+                next_due = min(next_due, item.next_status)
+            self.stop_event.wait(max(0.001, next_due - time.monotonic()))
+
+    def goto(self, width, channel=None):
         if not isinstance(width, (int, float)) or not 0 <= float(width) <= 1:
             raise ValueError("goto() 的取值必须在 0 到 1 之间。")
-        with self.lock:
-            if not self.homed or not self.calibrated:
-                raise GripperError("请先调用 home() 回到闭合参考位置。")
+        item = self._channel(channel)
+        if not item.homed or not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机请先调用 home()。")
         self._set_target(
-            round(self.config["open_position_steps"] * float(width)), float(width)
+            item, round(item.config["open_position_steps"] * float(width)), float(width)
         )
 
-    def reset(self) -> None:
-        with self.lock:
-            if not self.homed or not self.calibrated:
-                raise GripperError("请先调用 home() 回到闭合参考位置。")
-        self._set_target(
-            self.config["neutral_position_steps"],
-            self._width(self.config["neutral_position_steps"]),
-        )
-        result = self.wait()
-        if result["state"] != "已到位":
-            raise GripperError("复位失败：" + result["message"])
-
-    def wait(self, timeout=None) -> dict:
-        deadline = time.monotonic() + (timeout or self.config["motion_timeout_s"])
+    def wait(self, timeout=None, channel=None):
+        item = self._channel(channel)
+        deadline = time.monotonic() + (timeout or item.config["motion_timeout_s"])
         while time.monotonic() < deadline:
-            result = self.get_state()
+            result = self.get_state(item.index)
             if result["state"] not in {"运动中", "停止中", "未回零"}:
                 return result
             time.sleep(0.02)
-        raise GripperError("等待夹爪动作完成超时。")
+        raise GripperError(f"{item.index} 号舵机等待动作完成超时。")
 
-    def manual_step(self, direction: int) -> bool:
+    def reset(self, channel=None):
+        item = self._channel(channel)
+        if not item.homed or not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机请先调用 home()。")
+        self._set_target(
+            item,
+            item.config["neutral_position_steps"],
+            self._width(item, item.config["neutral_position_steps"]),
+        )
+        result = self.wait(channel=item.index)
+        if result["state"] != "已到位":
+            raise GripperError("复位失败：" + result["message"])
+
+    def manual_step(self, direction, channel=None):
         if direction not in {-1, 1}:
             raise ValueError("手动方向只能为 -1 或 1。")
-        with self.lock:
-            base = self.steps
-        accepted = self._set_target(
-            base + direction * self.config["calibration_step_steps"],
-            speed=min(self.config["speed"], 300),
+        item = self._channel(channel)
+        ok = self._set_target(
+            item,
+            item.steps + direction * item.config["calibration_step_steps"],
+            speed=min(item.config["speed"], 300),
         )
-        if accepted:
-            with self.lock:
-                if self.grip_test_active:
-                    self.grip_test_samples = []
-                    self.grip_test_version = self.command_version
-                    self.grip_test_collecting = False
-        return accepted
+        if ok and item.test_active:
+            item.test_samples = []
+            item.test_version = item.version
+            item.test_collecting = False
+        return ok
 
-    def _finish_grip_test_sampling(self) -> dict:
-        with self.lock:
-            self.grip_test_active = False
-            self.grip_test_collecting = False
-            samples = [
-                sample
-                for sample in self.grip_test_samples
-                if sample["load"] > 0 and sample["current_ma"] > 0
-            ][-5:]
-        if not samples:
-            return {"load": 0, "current_ma": 0}
-        return {
-            "load": round(sum(sample["load"] for sample in samples) / len(samples)),
-            "current_ma": round(
-                sum(sample["current_ma"] for sample in samples) / len(samples)
-            ),
-        }
+    def _keyboard(self, item, name, home):
+        with _KeyReader() as reader:
+            while True:
+                key = reader.read().lower()
+                if key in {"w", "s"}:
+                    if not self.manual_step(1 if key == "w" else -1, item.index):
+                        print(
+                            "该方向刚检测到阻塞；请改按相反方向，或按回车确认当前位置。"
+                        )
+                elif key in {"\r", "\n"}:
+                    self._request_stop(item, "就绪", "已停止在当前位置。")
+                    item.stopped.wait(1)
+                    if home:
+                        item.steps, item.homed, item.blocked_direction = 0, True, None
+                        item.state.update(
+                            state="就绪", width=0.0, message="已确认闭合参考位置。"
+                        )
+                    print(f"已确认{name}。\n")
+                    return True
+                elif key == "q":
+                    self._request_stop(item, "就绪", "用户已取消手动移动。")
+                    item.stopped.wait(1)
+                    print("已取消。\n")
+                    return False
 
-    def guided_grip_test(self) -> dict | None:
-        """在标定完成后，由用户逐步闭合并记录一次实际夹取时的反馈。"""
-        if not self.homed or not self.calibrated:
+    def home(self, channel=None):
+        item = self._channel(channel)
+        print(
+            f"\n{item.index} 号舵机回零：W/S 控制移动。到闭合参考位置后按回车；Q 退出。"
+        )
+        return self._keyboard(item, "闭合参考位置", True)
+
+    def calibrate_position(self, name, channel=None):
+        item = self._channel(channel)
+        print(f"\n标定 {item.index} 号舵机{name}：W/S 控制移动。到位后按回车；Q 退出。")
+        return item.steps if self._keyboard(item, name, False) else None
+
+    def guided_grip_test(self, channel=None):
+        item = self._channel(channel)
+        if not item.homed or not item.calibrated:
             raise GripperError("请先完成闭合、中立和张开位置标定。")
-
-        open_position = self.config["open_position_steps"]
-        close_direction = -1 if open_position > 0 else 1
-        close_key = "S" if close_direction < 0 else "W"
-        open_key = "W" if close_direction < 0 else "S"
+        close = -1 if item.config["open_position_steps"] > 0 else 1
+        close_key, open_key = ("S", "W") if close < 0 else ("W", "S")
         print(
-            "\n可选夹紧测试：请将有代表性的测试物放入已张开的夹爪中。"
+            f"\n{item.index} 号舵机可选夹紧测试：放入测试物。{close_key} 闭合、{open_key} 张开；回车记录，Q 跳过。"
         )
-        print(
-            f"{close_key} 为闭合、{open_key} 为张开。"
-            "确认夹稳后按回车记录反馈；Q 会立即停止并跳过测试。"
+        item.test_active, item.test_samples, item.test_version, item.test_collecting = (
+            True,
+            [],
+            None,
+            False,
         )
-        with self.lock:
-            self.grip_test_active = True
-            self.grip_test_samples = []
-            self.grip_test_version = None
-            self.grip_test_collecting = False
-
         with _KeyReader() as reader:
             while True:
                 key = reader.read().lower()
                 if key == close_key.lower():
-                    if not self.manual_step(close_direction):
-                        print("已检测到阻塞；请确认物体是否夹稳，或按相反方向松开。")
+                    self.manual_step(close, item.index)
                 elif key == open_key.lower():
-                    self.manual_step(-close_direction)
-                elif key in {"\r", "\n"}:
-                    telemetry = self._finish_grip_test_sampling()
-                    self._request_stop("就绪", "夹紧测试已停止在当前位置。")
-                    self._wait_stopped()
-                    print("已记录当前反馈。\n")
-                    return telemetry
-                elif key == "q":
-                    with self.lock:
-                        self.grip_test_active = False
-                        self.grip_test_samples = []
-                        self.grip_test_collecting = False
-                    self._request_stop("就绪", "用户已跳过夹紧测试。")
-                    self._wait_stopped()
-                    print("已跳过夹紧测试。\n")
-                    return None
-
-    def confirm_home(self) -> None:
-        with self.lock:
-            self.steps, self.homed, self.blocked_direction = 0, True, None
-            self.state.update(
-                state="就绪",
-                blocked_direction=None,
-                width=0.0,
-                message="已确认闭合参考位置。",
-            )
-
-    def _keyboard_position(self, name: str, home: bool) -> bool:
-        with _KeyReader() as reader:
-            while True:
-                key = reader.read().lower()
-                if key == "w":
-                    if not self.manual_step(1):
-                        print("该方向刚检测到阻塞；请改按 S，或按回车确认当前位置。")
-                elif key == "s":
-                    if not self.manual_step(-1):
-                        print("该方向刚检测到阻塞；请改按 W，或按回车确认当前位置。")
-                elif key in {"\r", "\n"}:
-                    self._request_stop("就绪", "已停止在当前位置。")
-                    self._wait_stopped()
-                    if home:
-                        self.confirm_home()
-                    print(f"已确认{name}。\n")
-                    return True
-                elif key == "q":
-                    self._request_stop("就绪", "用户已取消手动移动。")
-                    self._wait_stopped()
-                    print("已取消。\n")
-                    return False
-
-    def home(self) -> bool:
-        print(
-            "\n回零：W/S 控制移动。到闭合参考位置后按回车；Q 会立即停止并退出。"
-        )
-        return self._keyboard_position("闭合参考位置", True)
-
-    def calibrate_position(self, name: str) -> int | None:
-        print(
-            f"\n标定{name}：W/S 控制移动。到位后按回车；Q 会立即停止并退出。"
-        )
-        if not self._keyboard_position(name, False):
-            return None
-        with self.lock:
-            return self.steps
+                    self.manual_step(-close, item.index)
+                elif key in {"\r", "\n", "q"}:
+                    samples = [
+                        x for x in item.test_samples if x["load"] and x["current_ma"]
+                    ][-5:]
+                    item.test_active = item.test_collecting = False
+                    self._request_stop(item, "就绪", "夹紧测试已停止。")
+                    item.stopped.wait(1)
+                    if key == "q":
+                        print("已跳过夹紧测试。\n")
+                        return None
+                    if not samples:
+                        return {"load": 0, "current_ma": 0}
+                    return {
+                        "load": round(sum(x["load"] for x in samples) / len(samples)),
+                        "current_ma": round(
+                            sum(x["current_ma"] for x in samples) / len(samples)
+                        ),
+                    }

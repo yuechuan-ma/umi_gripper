@@ -1,4 +1,4 @@
-"""输入 0 到 1 的开度，演示夹爪控制与当前开度读取。"""
+"""演示单通道或双通道夹爪控制。"""
 
 from gripper import Gripper, GripperError
 
@@ -6,25 +6,31 @@ from gripper import Gripper, GripperError
 def main():
     try:
         with Gripper() as gripper:
-            if not gripper.home():
-                return
-            print(f"回零后的当前开度：{gripper.get_width():.3f}")
-            choice = input("输入 0 到 1 的目标开度，或 q 退出：").strip().lower()
-            if choice == "q":
-                return
-            try:
-                target_width = float(choice)
-            except ValueError:
-                print("输入无效：请输入 0 到 1 之间的数字，或 q。")
-                return
-            if not 0 <= target_width <= 1:
-                print("输入无效：目标开度必须在 0 到 1 之间。")
-                return
-            gripper.goto(target_width)
-            print("目标已更新，后台正在持续检查位置、负载和电流……")
-            result = gripper.wait()
-            print(f"结果：{result['state']}。{result['message']}")
-            print(f"当前开度：{gripper.get_width():.3f}")
+            channels = sorted(gripper.channels)
+            for channel in channels:
+                if not gripper.home(channel):
+                    return
+                print(f"{channel} 号回零后的当前开度：{gripper.get_width(channel):.3f}")
+            while True:
+                choice = (
+                    input("输入“通道号 开度”（例如 0 0.8），或 q 退出：")
+                    .strip()
+                    .lower()
+                )
+                if choice == "q":
+                    return
+                try:
+                    channel_text, width_text = choice.split()
+                    channel, width = int(channel_text), float(width_text)
+                    if not 0 <= width <= 1:
+                        raise ValueError
+                except ValueError:
+                    print("输入无效：请输入通道号和 0 到 1 的开度。")
+                    continue
+                gripper.goto(width, channel)
+                result = gripper.wait(channel=channel)
+                print(f"{channel} 号结果：{result['state']}。{result['message']}")
+                print(f"{channel} 号当前开度：{gripper.get_width(channel):.3f}")
     except GripperError as exc:
         print(f"操作失败：{exc}")
 
