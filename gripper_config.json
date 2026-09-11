@@ -1,0 +1,17 @@
+{
+  "serial_port": "COM3",
+  "servo_id": 5,
+  "baudrate": 1000000,
+  "servo_model_number": 777,
+  "closed_position_steps": 0,
+  "neutral_position_steps": 1457,
+  "open_position_steps": 5092,
+  "speed": 1200,
+  "grip_strength": 50,
+  "control_frequency_hz": 20,
+  "status_frequency_hz": 50,
+  "calibration_step_steps": 128,
+  "motion_timeout_s": 30,
+  "contact_load_threshold": null,
+  "contact_current_ma": null
+}
