@@ -217,8 +217,13 @@ def _scan(baudrates: tuple[int, ...]) -> list[dict]:
     found = []
     for info in list_ports.comports():
         handler = PortHandler(info.device)
+        opened = False
         try:
-            if not handler.openPort():
+            try:
+                opened = handler.openPort()
+            except Exception:
+                continue
+            if not opened:
                 continue
             packet = sms_sts(handler)
             for baudrate in baudrates:
@@ -236,7 +241,8 @@ def _scan(baudrates: tuple[int, ...]) -> list[dict]:
                             }
                         )
         finally:
-            handler.closePort()
+            if opened:
+                handler.closePort()
     return found
 
 
