@@ -64,7 +64,7 @@ def optional_grip_test(gripper, config):
 
 
 def main():
-    print("夹爪初始化：请确认跳线在 B 位置，且夹爪周围无人和无障碍物。")
+    print("夹爪初始化：请确认跳线在 B 位置。")
     if input("按回车扫描串口和 ID；输入 q 退出：").strip().lower() == "q":
         return
     candidates = discover_servos()
@@ -98,7 +98,7 @@ def main():
             bus.configure_speed_mode()
         with Gripper(config=config, allow_uninitialized=True) as gripper:
             print(
-                "已切换为多圈速度模式。W/S 每次只会低速移动一小段；回车和 Q 都会明确发送停止命令。标定过程会持续检查负载、电流和物理限位。"
+                "已切换为多圈速度模式。W/S 控制移动。"
             )
             if not gripper.home():
                 return

@@ -617,10 +617,9 @@ class Gripper:
         open_key = "W" if close_direction < 0 else "S"
         print(
             "\n可选夹紧测试：请将有代表性的测试物放入已张开的夹爪中。"
-            "确保可随时断电，手和工具远离夹爪。"
         )
         print(
-            f"{close_key} 为闭合、{open_key} 为张开；每按一次只低速移动一小段。"
+            f"{close_key} 为闭合、{open_key} 为张开。"
             "确认夹稳后按回车记录反馈；Q 会立即停止并跳过测试。"
         )
         with self.lock:
@@ -688,13 +687,13 @@ class Gripper:
 
     def home(self) -> bool:
         print(
-            "\n回零：W 为正向，S 为反向；每按一次只低速走一小段。到闭合参考位置后按回车；Q 会立即停止并退出。"
+            "\n回零：W/S 控制移动。到闭合参考位置后按回车；Q 会立即停止并退出。"
         )
         return self._keyboard_position("闭合参考位置", True)
 
     def calibrate_position(self, name: str) -> int | None:
         print(
-            f"\n标定{name}：W 为正向，S 为反向；每按一次只低速走一小段。到位后按回车；Q 会立即停止并退出。"
+            f"\n标定{name}：W/S 控制移动。到位后按回车；Q 会立即停止并退出。"
         )
         if not self._keyboard_position(name, False):
             return None
