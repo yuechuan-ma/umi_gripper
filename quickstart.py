@@ -13,14 +13,14 @@ def main():
                 print(f"{channel} 号回零后的当前开度：{gripper.get_width(channel):.3f}")
             while True:
                 choice = (
-                    input("输入“通道号 开度”（例如 0 0.8），或 q 退出：")
+                    input("输入“开度 通道号”（例如 0.8 0），或 q 退出：")
                     .strip()
                     .lower()
                 )
                 if choice == "q":
                     return
                 try:
-                    channel_text, width_text = choice.split()
+                    width_text, channel_text = choice.split()
                     channel, width = int(channel_text), float(width_text)
                     if not 0 <= width <= 1:
                         raise ValueError
