@@ -22,6 +22,8 @@ from scservo_sdk import (
 )
 
 STEPS_PER_TURN = 4096
+POSITION_TOLERANCE_STEPS = 12
+INITIAL_POSITION_TIMEOUT_S = 2.0
 DEFAULT_BAUDRATES = (1_000_000, 500_000, 250_000, 115_200, 57_600, 38_400)
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("gripper_config.json")
 
@@ -64,8 +66,6 @@ def default_servo_config(selected: dict | None = None) -> dict:
         "status_frequency_hz": 50,
         "calibration_step_steps": 128,
         "motion_timeout_s": 30,
-        "contact_load_threshold": None,
-        "contact_current_ma": None,
     }
 
 
@@ -116,14 +116,6 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
     _integer(config, "status_frequency_hz", 1, 100)
     _integer(config, "calibration_step_steps", 10, 1024)
     _integer(config, "motion_timeout_s", 2, 120)
-    load, current = config.get("contact_load_threshold"), config.get(
-        "contact_current_ma"
-    )
-    if (load is None) != (current is None):
-        raise ConfigError("夹紧阈值必须同时填写，或同时留空。")
-    if load is not None:
-        _integer(config, "contact_load_threshold", 1, 1000)
-        _integer(config, "contact_current_ma", 1, 5000)
     if not calibrated:
         return
     for key in (
@@ -248,8 +240,11 @@ class ServoBus:
             )
 
     def prepare(self, sid: int, strength: int) -> None:
-        self._write2(sid, 48, strength * 10, "设置夹紧力度")
+        self.set_grip_strength(sid, strength)
         self._write1(sid, SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
+
+    def set_grip_strength(self, sid: int, strength: int) -> None:
+        self._write2(sid, 48, strength * 10, "设置夹紧力度")
 
     def change_id(self, old_id: int, new_id: int) -> None:
         self._write1(old_id, 55, 0, "解锁舵机设置")
@@ -358,10 +353,11 @@ class _Channel:
     stopped: threading.Event = field(default_factory=threading.Event)
     state: dict = field(default_factory=dict)
     next_status: float = 0
-    test_active: bool = False
-    test_collecting: bool = False
-    test_version: int | None = None
-    test_samples: list = field(default_factory=list)
+    initial_position_ready: threading.Event = field(default_factory=threading.Event)
+    initial_position_error: GripperError | None = None
+    pending_strength: int | None = None
+    strength_error: GripperError | None = None
+    strength_applied: threading.Event = field(default_factory=threading.Event)
 
 
 class Gripper:
@@ -379,12 +375,14 @@ class Gripper:
             )
         }
         validate_config(self.config, calibrated=not allow_uninitialized)
-        self.lock, self.stop_event, self.buses, self.channels = (
+        self.lock, self.stop_event, self.wakeup, self.buses, self.channels = (
             threading.RLock(),
+            threading.Event(),
             threading.Event(),
             {},
             {},
         )
+        self.strength_lock = threading.Lock()
         try:
             for index, item in enumerate(self.config["servos"]):
                 if item is None:
@@ -416,6 +414,11 @@ class Gripper:
             raise
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
+        try:
+            self._wait_for_initial_positions()
+        except Exception:
+            self.disconnect()
+            raise
 
     def __enter__(self):
         return self
@@ -450,6 +453,22 @@ class Gripper:
             raise GripperError(f"{channel} 号舵机未配置或不存在。")
         return self.channels[channel]
 
+    def _wait_for_initial_positions(self):
+        deadline = time.monotonic() + INITIAL_POSITION_TIMEOUT_S
+        for item in self.channels.values():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not item.initial_position_ready.wait(remaining):
+                with self.lock:
+                    error = item.initial_position_error
+                detail = f"：{error}" if error else "。"
+                raise GripperError(
+                    f"{item.index} 号舵机未能在 {INITIAL_POSITION_TIMEOUT_S:g} 秒内读取当前位置"
+                    + detail
+                )
+            with self.lock:
+                if item.initial_position_error is not None:
+                    raise item.initial_position_error
+
     @staticmethod
     def _width(item, position):
         closed = item.config["closed_position_steps"]
@@ -459,9 +478,30 @@ class Gripper:
     @staticmethod
     def _position_is_valid(item, position):
         closed = item.config["closed_position_steps"]
-        span = item.config["open_position_steps"] - closed
-        offset = position - closed
-        return offset * span >= 0 and abs(offset) <= abs(span)
+        opened = item.config["open_position_steps"]
+        return (
+            min(closed, opened) - POSITION_TOLERANCE_STEPS
+            <= position
+            <= max(closed, opened) + POSITION_TOLERANCE_STEPS
+        )
+
+    @staticmethod
+    def _invalid_position_message(item):
+        if item.position is None:
+            status = item.state.get("message", "尚未成功读取舵机位置")
+            return f"{item.index} 号舵机尚未读到当前位置。当前状态：{status}。"
+        if not item.calibrated:
+            return f"{item.index} 号舵机当前位置 {item.position} 无法用于未完成标定的操作。"
+        closed = item.config["closed_position_steps"]
+        opened = item.config["open_position_steps"]
+        return (
+            f"{item.index} 号舵机当前读数为 {item.position}，超出标定范围 "
+            f"{min(closed, opened)} 到 {max(closed, opened)}"
+            f"（闭合位置 {closed}，张开位置 {opened}）。"
+            f"端点允许 {POSITION_TOLERANCE_STEPS} 步的停靠误差。"
+            "通常是确认标定点后舵机仍有少量移动，或开合边界标得过紧；"
+            "请重新标定并在两个端点留出少量余量。"
+        )
 
     @staticmethod
     def _direction(item, start, end):
@@ -476,12 +516,8 @@ class Gripper:
 
     @staticmethod
     def _thresholds(item):
-        c = item.config
-        return (
-            (c["contact_load_threshold"], c["contact_current_ma"])
-            if c.get("contact_load_threshold") is not None
-            else (max(80, c["grip_strength"] * 6), 200 + c["grip_strength"] * 10)
-        )
+        strength = item.config["grip_strength"]
+        return strength * 9, strength * 22.5
 
     def get_state(self, channel=None):
         item = self._channel(channel)
@@ -490,10 +526,10 @@ class Gripper:
 
     def get_width(self, channel=None):
         item = self._channel(channel)
-        if not item.calibrated or item.position is None:
-            raise GripperError(f"{item.index} 号舵机尚未得到有效的当前位置。")
-        if not item.position_valid:
-            raise GripperError(f"{item.index} 号舵机当前位置位于标定范围之外。")
+        if not item.calibrated:
+            raise GripperError(f"{item.index} 号舵机尚未完成标定。")
+        if item.position is None or not item.position_valid:
+            raise GripperError(self._invalid_position_message(item))
         return self._width(item, item.position)
 
     def _request_stop(self, item, state, message, *, blocked_direction=None):
@@ -515,6 +551,7 @@ class Gripper:
                 target_width=None,
                 message="正在停止舵机。",
             )
+        self.wakeup.set()
 
     def _finish_stop(self, item, version):
         with self.lock:
@@ -534,11 +571,11 @@ class Gripper:
     def _set_target(self, item, target, label=None, speed=None):
         with self.lock:
             if item.position is None or not item.position_valid:
-                raise GripperError(f"{item.index} 号舵机当前位置无效，拒绝运动。")
+                raise GripperError(self._invalid_position_message(item))
             direction = self._direction(item, item.position, target)
             if (
                 item.blocked_direction == direction
-                and abs(item.position - target) > 12
+                and abs(item.position - target) > POSITION_TOLERANCE_STEPS
             ):
                 return False
             if item.blocked_direction != direction:
@@ -553,7 +590,50 @@ class Gripper:
                 target_width=label,
                 message="正在移动。",
             )
-            return True
+        self.wakeup.set()
+        return True
+
+    def set_grip_strength(self, strength, channel=None):
+        """由后台循环写入新的扭矩上限，并等待实际写入完成。"""
+        if (
+            isinstance(strength, bool)
+            or not isinstance(strength, int)
+            or not 1 <= strength <= 100
+        ):
+            raise ValueError("夹紧力度必须是 1 到 100 的整数。")
+        item = self._channel(channel)
+        with self.strength_lock:
+            with self.lock:
+                if self.stop_event.is_set():
+                    raise GripperError("夹爪已断开，无法更新夹紧力度。")
+                item.pending_strength = strength
+                item.strength_error = None
+                item.strength_applied.clear()
+            self.wakeup.set()
+            if not item.strength_applied.wait(2):
+                raise GripperError("更新夹紧力度超时。")
+            with self.lock:
+                if item.strength_error is not None:
+                    raise item.strength_error
+
+    def _apply_pending_strength(self, item):
+        with self.lock:
+            strength = item.pending_strength
+        if strength is None:
+            return
+        try:
+            item.bus.set_grip_strength(item.config["servo_id"], strength)
+        except GripperError as exc:
+            with self.lock:
+                item.pending_strength = None
+                item.strength_error = exc
+                item.strength_applied.set()
+            return
+        with self.lock:
+            item.config["grip_strength"] = strength
+            item.pending_strength = None
+            item.strength_error = None
+            item.strength_applied.set()
 
     def _update(self, item):
         try:
@@ -580,22 +660,20 @@ class Gripper:
                     ),
                     telemetry=t,
                 )
-                if (
-                    item.test_active
-                    and item.test_collecting
-                    and item.test_version == version
-                    and target is not None
-                ):
-                    item.test_samples = (
-                        item.test_samples
-                        + [{"load": abs(t["load"]), "current_ma": abs(t["current_ma"])}]
-                    )[-25:]
+                if not item.initial_position_ready.is_set():
+                    if item.position_valid:
+                        item.initial_position_error = None
+                    else:
+                        item.initial_position_error = GripperError(
+                            self._invalid_position_message(item)
+                        )
+                    item.initial_position_ready.set()
             if not item.position_valid:
                 with self.lock:
                     item.target = item.target_speed = None
                     item.state.update(
                         state="异常",
-                        message="当前位置位于标定范围之外；请运行 gripper_cal.py 重新标定。",
+                        message=self._invalid_position_message(item),
                     )
                 return
             if pending:
@@ -624,18 +702,17 @@ class Gripper:
                     f"{direction} 方向检测到物体或物理限位，已停止继续施力。",
                     blocked_direction=direction,
                 )
-            elif remaining <= 12:
+            elif remaining <= POSITION_TOLERANCE_STEPS:
                 self._request_stop(item, "已到位", "已到达目标位置。")
             elif item.sent_version != version:
                 item.bus.set_position(item.config["servo_id"], target, target_speed)
                 item.sent_version = version
-                if item.test_active and item.test_version == version:
-                    item.test_collecting = True
                 item.state.update(
                     state="运动中", blocked_direction=None, message="正在移动。"
                 )
         except GripperError as exc:
             with self.lock:
+                item.initial_position_error = exc
                 item.target = item.target_speed = None
                 item.stop_pending = False
                 item.stopped.set()
@@ -645,11 +722,13 @@ class Gripper:
         while not self.stop_event.is_set():
             now, next_due = time.monotonic(), time.monotonic() + 0.05
             for item in self.channels.values():
+                self._apply_pending_strength(item)
                 if now >= item.next_status:
                     self._update(item)
                     item.next_status = now + 1 / item.config["status_frequency_hz"]
                 next_due = min(next_due, item.next_status)
-            self.stop_event.wait(max(0.001, next_due - time.monotonic()))
+            self.wakeup.wait(max(0.001, next_due - time.monotonic()))
+            self.wakeup.clear()
 
     def goto(self, width, channel=None):
         if not isinstance(width, (int, float)) or not 0 <= float(width) <= 1:
@@ -698,10 +777,6 @@ class Gripper:
             ),
             speed=min(item.config["speed"], 300),
         )
-        if ok and item.test_active:
-            item.test_samples = []
-            item.test_version = item.version
-            item.test_collecting = False
         return ok
 
     def _keyboard(self, item, name):
@@ -738,44 +813,53 @@ class Gripper:
         item = self._channel(channel)
         if not item.calibrated:
             raise GripperError("请先完成闭合、中立和张开位置标定。")
-        close = (
-            -1
-            if item.config["open_position_steps"]
-            > item.config["closed_position_steps"]
-            else 1
-        )
-        close_key, open_key = ("S", "W") if close < 0 else ("W", "S")
+        original_strength = item.config["grip_strength"]
+        strength = original_strength
+
+        def open_to_maximum():
+            self.goto(1.0, item.index)
+            result = self.wait(channel=item.index)
+            if result["state"] == "异常":
+                raise GripperError("张开夹爪失败：" + result["message"])
+
+        open_to_maximum()
         print(
-            f"\n{item.index} 号舵机可选夹紧测试：放入测试物。{close_key} 闭合、{open_key} 张开；回车记录，Q 跳过。"
+            f"\n{item.index} 号舵机夹紧测试，当前力度：{strength}。"
+            "请放入测试物，按回车自动闭合；Q 退出。"
         )
-        item.test_active, item.test_samples, item.test_version, item.test_collecting = (
-            True,
-            [],
-            None,
-            False,
-        )
+        waiting_to_close = True
         with _KeyReader() as reader:
             while True:
                 key = reader.read().lower()
-                if key == close_key.lower():
-                    self.manual_step(close, item.index)
-                elif key == open_key.lower():
-                    self.manual_step(-close, item.index)
-                elif key in {"\r", "\n", "q"}:
-                    samples = [
-                        x for x in item.test_samples if x["load"] and x["current_ma"]
-                    ][-5:]
-                    item.test_active = item.test_collecting = False
-                    self._request_stop(item, "就绪", "夹紧测试已停止。")
-                    item.stopped.wait(1)
-                    if key == "q":
-                        print("已跳过夹紧测试。\n")
-                        return None
-                    if not samples:
-                        return {"load": 0, "current_ma": 0}
-                    return {
-                        "load": round(sum(x["load"] for x in samples) / len(samples)),
-                        "current_ma": round(
-                            sum(x["current_ma"] for x in samples) / len(samples)
-                        ),
-                    }
+                if key == "q":
+                    open_to_maximum()
+                    if strength != original_strength:
+                        self.set_grip_strength(original_strength, item.index)
+                    print("已跳过夹紧测试。\n")
+                    return None
+                if waiting_to_close and key in {"\r", "\n"}:
+                    self.goto(0.0, item.index)
+                    result = self.wait(channel=item.index)
+                    if result["state"] == "异常":
+                        raise GripperError("闭合夹爪失败：" + result["message"])
+                    print(
+                        f"本轮力度：{strength}。感受夹持效果后："
+                        "按 W 增加 5，按 S 减少 5，按回车确认保存。"
+                    )
+                    waiting_to_close = False
+                    continue
+                if not waiting_to_close and key in {"w", "s"}:
+                    updated = max(1, min(100, strength + (5 if key == "w" else -5)))
+                    if updated == strength:
+                        print(f"当前力度已是 {strength}，无法继续调整。")
+                        continue
+                    self.set_grip_strength(updated, item.index)
+                    strength = updated
+                    print(f"当前力度已更新为：{strength}。正在重新张开夹爪。")
+                    open_to_maximum()
+                    print("请重新放入测试物，按回车自动闭合；Q 退出。")
+                    waiting_to_close = True
+                    continue
+                if not waiting_to_close and key in {"\r", "\n"}:
+                    print(f"已确认夹紧力度：{strength}。\n")
+                    return strength

@@ -44,25 +44,28 @@ def optional_grip_test(gripper, config, channel):
     ):
         print("已跳过夹紧测试。")
         return
-    telemetry = gripper.guided_grip_test(channel)
-    if telemetry is None:
+    strength = gripper.guided_grip_test(channel)
+    if strength is None:
         return
-    load, current = abs(telemetry["load"]), abs(telemetry["current_ma"])
-    if not load or not current:
-        print("未得到有效的负载或电流反馈，不保存夹紧判定值。")
-        return
-    suggested_load, suggested_current = max(1, min(1000, round(load * 0.95))), max(
-        1, min(5000, round(current * 0.95))
+    config["grip_strength"] = strength
+    print("已保存夹紧力度。")
+
+
+def completed_config(config):
+    position_keys = (
+        "closed_position_steps",
+        "neutral_position_steps",
+        "open_position_steps",
     )
-    print(
-        f"记录到：负载 {load}，电流 {current}mA。建议判定值：负载 {suggested_load}，电流 {suggested_current}mA。"
-    )
-    if input("确认已夹稳，输入 y 保存建议值；其他输入不保存：").strip().lower() == "y":
-        config["contact_load_threshold"], config["contact_current_ma"] = (
-            suggested_load,
-            suggested_current,
-        )
-        print("已保存夹紧判定值。")
+    servos = [
+        item
+        if item is not None and all(item.get(key) is not None for key in position_keys)
+        else None
+        for item in config["servos"]
+    ]
+    saved = {"servos": servos}
+    validate_config(saved)
+    return saved
 
 
 def configure_position_mode(config):
@@ -135,6 +138,8 @@ def main():
                 gripper.channels[channel].config.update(item)
                 gripper.channels[channel].calibrated = True
                 optional_grip_test(gripper, item, channel)
+                save_config(completed_config(config))
+                print(f"{channel} 号舵机标定已保存。")
             validate_config(config)
         save_config(config)
         print("标定完成并已保存。之后创建 Gripper 对象会直接读取当前位置。")
