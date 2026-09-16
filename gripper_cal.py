@@ -1,5 +1,8 @@
 """通过 W/S 分别完成 0、1 号夹爪舵机标定。"""
 
+import argparse
+import threading
+
 from gripper import (
     DEFAULT_CONFIG_PATH,
     Gripper,
@@ -10,6 +13,36 @@ from gripper import (
     save_config,
     validate_config,
 )
+
+STATUS_DISPLAY_INTERVAL_S = 0.5
+
+
+def _status_text(gripper):
+    entries = []
+    for channel in gripper.channels:
+        state = gripper.get_state(channel)
+        telemetry = state.get("telemetry")
+        if telemetry is None:
+            entries.append(f"{channel} 号：正在读取状态")
+            continue
+        entries.append(
+            f"{channel} 号：位置 {telemetry['raw_position']}，"
+            f"负载 {telemetry['load']}，电流 {telemetry['current_ma']}mA，"
+            f"状态 {state['state']}"
+        )
+    return "状态：" + "；".join(entries)
+
+
+def start_status_display(gripper):
+    stop_event = threading.Event()
+
+    def display():
+        while not stop_event.wait(STATUS_DISPLAY_INTERVAL_S):
+            print(_status_text(gripper))
+
+    thread = threading.Thread(target=display, daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 def choose(candidates, channel, forbidden=None):
@@ -90,7 +123,7 @@ def configure_position_mode(config):
             bus.close()
 
 
-def main():
+def main(log=False):
     print("夹爪初始化：请确认跳线在 B 位置。")
     if input("按回车扫描串口和 ID；输入 q 退出：").strip().lower() == "q":
         return
@@ -116,31 +149,39 @@ def main():
         validate_config(config, calibrated=False)
         configure_position_mode(config)
         with Gripper(config=config, allow_uninitialized=True) as gripper:
-            print(
-                "已切换为单圈绝对位置模式，并将各舵机当前安装角度设为中位。"
-                "每个通道依次使用 W/S 标定。"
-            )
-            for channel, item in enumerate(config["servos"]):
-                if item is None:
-                    continue
-                closed = gripper.calibrate_position("闭合位置", channel)
-                if closed is None:
-                    return
-                neutral = gripper.calibrate_position("中立位置", channel)
-                if neutral is None:
-                    return
-                opened = gripper.calibrate_position("张开位置", channel)
-                if opened is None:
-                    return
-                item["closed_position_steps"] = closed
-                item["neutral_position_steps"] = neutral
-                item["open_position_steps"] = opened
-                gripper.channels[channel].config.update(item)
-                gripper.channels[channel].calibrated = True
-                optional_grip_test(gripper, item, channel)
-                save_config(completed_config(config))
-                print(f"{channel} 号舵机标定已保存。")
-            validate_config(config)
+            stop_display = display_thread = None
+            if log:
+                stop_display, display_thread = start_status_display(gripper)
+            try:
+                print(
+                    "已切换为单圈绝对位置模式，并将各舵机当前安装角度设为中位。"
+                    "每个通道依次使用 W/S 标定。"
+                )
+                for channel, item in enumerate(config["servos"]):
+                    if item is None:
+                        continue
+                    closed = gripper.calibrate_position("闭合位置", channel)
+                    if closed is None:
+                        return
+                    neutral = gripper.calibrate_position("中立位置", channel)
+                    if neutral is None:
+                        return
+                    opened = gripper.calibrate_position("张开位置", channel)
+                    if opened is None:
+                        return
+                    item["closed_position_steps"] = closed
+                    item["neutral_position_steps"] = neutral
+                    item["open_position_steps"] = opened
+                    gripper.channels[channel].config.update(item)
+                    gripper.channels[channel].calibrated = True
+                    optional_grip_test(gripper, item, channel)
+                    save_config(completed_config(config))
+                    print(f"{channel} 号舵机标定已保存。")
+                validate_config(config)
+            finally:
+                if stop_display is not None:
+                    stop_display.set()
+                    display_thread.join()
         save_config(config)
         print("标定完成并已保存。之后创建 Gripper 对象会直接读取当前位置。")
     except GripperError as exc:
@@ -148,4 +189,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="标定夹爪舵机。")
+    parser.add_argument("--log", action="store_true", help="每 0.5 秒显示一次舵机状态。")
+    main(parser.parse_args().log)

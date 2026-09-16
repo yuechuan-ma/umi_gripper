@@ -1,32 +1,6 @@
 {
   "servos": [
-    {
-      "serial_port": "COM3",
-      "servo_id": 5,
-      "baudrate": 1000000,
-      "servo_model_number": 777,
-      "closed_position_steps": 1636,
-      "neutral_position_steps": 2277,
-      "open_position_steps": 3362,
-      "speed": 1200,
-      "grip_strength": 60,
-      "status_frequency_hz": 50,
-      "calibration_step_steps": 128,
-      "motion_timeout_s": 30
-    },
-    {
-      "serial_port": "COM3",
-      "servo_id": 6,
-      "baudrate": 1000000,
-      "servo_model_number": 777,
-      "closed_position_steps": 1509,
-      "neutral_position_steps": 2140,
-      "open_position_steps": 3100,
-      "speed": 1200,
-      "grip_strength": 50,
-      "status_frequency_hz": 50,
-      "calibration_step_steps": 128,
-      "motion_timeout_s": 30
-    }
+    null,
+    null
   ]
 }

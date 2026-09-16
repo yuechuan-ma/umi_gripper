@@ -24,6 +24,9 @@ from scservo_sdk import (
 STEPS_PER_TURN = 4096
 POSITION_TOLERANCE_STEPS = 12
 INITIAL_POSITION_TIMEOUT_S = 2.0
+CLOSING_STALL_WINDOW_S = 0.2
+OPENING_STALL_WINDOW_S = 0.5
+STALL_MOVEMENT_STEPS = 3
 DEFAULT_BAUDRATES = (1_000_000, 500_000, 250_000, 115_200, 57_600, 38_400)
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("gripper_config.json")
 
@@ -345,7 +348,8 @@ class _Channel:
     target_speed: int | None = None
     version: int = 0
     blocked_direction: str | None = None
-    blocked_samples: int = 0
+    motion_reference_position: int | None = None
+    motion_reference_at: float | None = None
     sent_version: int | None = None
     stop_pending: bool = False
     stop_version: int = 0
@@ -515,9 +519,8 @@ class Gripper:
         return "张开" if delta * span > 0 else "闭合"
 
     @staticmethod
-    def _thresholds(item):
-        strength = item.config["grip_strength"]
-        return strength * 9, strength * 22.5
+    def _stall_window(direction):
+        return CLOSING_STALL_WINDOW_S if direction == "闭合" else OPENING_STALL_WINDOW_S
 
     def get_state(self, channel=None):
         item = self._channel(channel)
@@ -537,7 +540,10 @@ class Gripper:
             item.version += 1
             item.target = None
             item.target_speed = None
-            item.blocked_samples = 0
+            if blocked_direction is not None:
+                item.blocked_direction = blocked_direction
+            item.motion_reference_position = None
+            item.motion_reference_at = None
             item.sent_version = None
             item.stop_pending, item.stop_version, item.stop_result = (
                 True,
@@ -572,18 +578,14 @@ class Gripper:
         with self.lock:
             if item.position is None or not item.position_valid:
                 raise GripperError(self._invalid_position_message(item))
-            direction = self._direction(item, item.position, target)
-            if (
-                item.blocked_direction == direction
-                and abs(item.position - target) > POSITION_TOLERANCE_STEPS
-            ):
-                return False
-            if item.blocked_direction != direction:
+            if item.blocked_direction is not None:
                 item.blocked_direction = None
             item.version += 1
             item.target = target
             item.target_speed = speed or item.config["speed"]
-            item.blocked_samples, item.sent_version = 0, None
+            item.motion_reference_position = None
+            item.motion_reference_at = None
+            item.sent_version = None
             item.state.update(
                 state="运动中",
                 blocked_direction=None,
@@ -592,6 +594,18 @@ class Gripper:
             )
         self.wakeup.set()
         return True
+
+    def _hold_closed(self, item):
+        with self.lock:
+            item.blocked_direction = "闭合"
+            item.motion_reference_position = None
+            item.motion_reference_at = None
+            item.state.update(
+                state="已夹住",
+                blocked_direction="闭合",
+                message="闭合方向检测到物体，正在按当前夹紧力度保持。",
+            )
+            item.stopped.set()
 
     def set_grip_strength(self, strength, channel=None):
         """由后台循环写入新的扭矩上限，并等待实际写入完成。"""
@@ -688,27 +702,46 @@ class Gripper:
             if target is None:
                 return
             direction = self._direction(item, position, target)
-            high = (
-                abs(t["load"]) >= self._thresholds(item)[0]
-                and abs(t["current_ma"]) >= self._thresholds(item)[1]
-            )
-            item.blocked_samples = item.blocked_samples + 1 if high else 0
             remaining = abs(position - target)
-            if item.blocked_samples >= 3:
-                item.blocked_direction = direction
+            if item.blocked_direction == direction:
+                return
+            if remaining <= POSITION_TOLERANCE_STEPS:
+                self._request_stop(item, "已到位", "已到达目标位置。")
+            elif item.sent_version != version:
+                item.bus.set_position(item.config["servo_id"], target, target_speed)
+                with self.lock:
+                    if item.version != version:
+                        return
+                    item.sent_version = version
+                    item.motion_reference_position = position
+                    item.motion_reference_at = time.monotonic()
+                    item.state.update(
+                        state="运动中", blocked_direction=None, message="正在移动。"
+                    )
+            else:
+                now = time.monotonic()
+                with self.lock:
+                    reference_position = item.motion_reference_position
+                    reference_at = item.motion_reference_at
+                    if (
+                        reference_position is None
+                        or reference_at is None
+                        or abs(position - reference_position) >= STALL_MOVEMENT_STEPS
+                    ):
+                        item.motion_reference_position = position
+                        item.motion_reference_at = now
+                        return
+                    stalled = now - reference_at >= self._stall_window(direction)
+                if not stalled:
+                    return
+                if direction == "闭合":
+                    self._hold_closed(item)
+                    return
                 self._request_stop(
                     item,
                     "已阻塞",
                     f"{direction} 方向检测到物体或物理限位，已停止继续施力。",
                     blocked_direction=direction,
-                )
-            elif remaining <= POSITION_TOLERANCE_STEPS:
-                self._request_stop(item, "已到位", "已到达目标位置。")
-            elif item.sent_version != version:
-                item.bus.set_position(item.config["servo_id"], target, target_speed)
-                item.sent_version = version
-                item.state.update(
-                    state="运动中", blocked_direction=None, message="正在移动。"
                 )
         except GripperError as exc:
             with self.lock:
@@ -769,7 +802,7 @@ class Gripper:
         if direction not in {-1, 1}:
             raise ValueError("手动方向只能为 -1 或 1。")
         item = self._channel(channel)
-        ok = self._set_target(
+        return self._set_target(
             item,
             min(
                 STEPS_PER_TURN - 1,
@@ -777,7 +810,6 @@ class Gripper:
             ),
             speed=min(item.config["speed"], 300),
         )
-        return ok
 
     def _keyboard(self, item, name):
         with _KeyReader() as reader:
@@ -785,14 +817,9 @@ class Gripper:
                 key = reader.read().lower()
                 if key in {"w", "s"}:
                     try:
-                        moved = self.manual_step(1 if key == "w" else -1, item.index)
+                        self.manual_step(1 if key == "w" else -1, item.index)
                     except GripperError as exc:
                         print(str(exc))
-                        continue
-                    if not moved:
-                        print(
-                            "该方向刚检测到阻塞；请改按相反方向，或按回车确认当前位置。"
-                        )
                 elif key in {"\r", "\n"}:
                     self._request_stop(item, "就绪", "已停止在当前位置。")
                     item.stopped.wait(1)
