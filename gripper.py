@@ -65,7 +65,7 @@ def default_servo_config(selected: dict | None = None) -> dict:
         "neutral_position_steps": None,
         "open_position_steps": None,
         "speed": 1200,
-        "grip_strength": 50,
+        "grip_strength": 60,
         "status_frequency_hz": 50,
         "calibration_step_steps": 128,
         "motion_timeout_s": 30,
@@ -243,8 +243,47 @@ class ServoBus:
             )
 
     def prepare(self, sid: int, strength: int) -> None:
+        # self.configure_overload_protection(sid)
         self.set_grip_strength(sid, strength)
         self._write1(sid, SMS_STS_TORQUE_ENABLE, 1, "开启扭矩")
+
+    def configure_overload_protection(self, sid: int) -> None:
+        """写入负载过载参数，同时保留其余卸载保护开关。"""
+        desired = {
+            34: 20,   # 过载后保持 80% 的最大扭矩。
+            35: 200,  # 保护时间 2 秒，单位为 10ms。
+            36: 80,  # 过载阈值为最大扭矩的 100%。
+        }
+        unload_condition = self._read1(sid, 19, "读取卸载条件")
+        protection_current_needs_update = (
+            self._read2(sid, 28, "读取保护电流") != 400
+        )
+
+        # 关闭负载过载自动卸力
+        # desired_unload_condition = unload_condition & ~0x20
+        # 开启负载过载自动卸力
+        desired_unload_condition = unload_condition | 0x20
+
+        updates = [
+            (address, value, action)
+            for address, value, action in (
+                (34, desired[34], "设置过载后保持力度"),
+                (35, desired[35], "设置过载触发持续时间"),
+                (36, desired[36], "设置过载阈值"),
+                (19, desired_unload_condition, "设置负载过载自动卸力"),
+            )
+            if self._read1(sid, address, f"读取{action}") != value
+        ]
+        if not protection_current_needs_update and not updates:
+            return
+        self._write1(sid, 55, 0, "解锁舵机设置")
+        try:
+            if protection_current_needs_update:
+                self._write2(sid, 28, 500, "设置保护电流")
+            for address, value, action in updates:
+                self._write1(sid, address, value, action)
+        finally:
+            self._write1(sid, 55, 1, "锁定舵机设置")
 
     def set_grip_strength(self, sid: int, strength: int) -> None:
         self._write2(sid, 48, strength * 10, "设置夹紧力度")
