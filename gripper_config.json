@@ -1,6 +1,19 @@
 {
   "servos": [
     null,
-    null
+    {
+      "serial_port": "COM3",
+      "servo_id": 4,
+      "baudrate": 1000000,
+      "servo_model_number": 777,
+      "closed_position_steps": 2165,
+      "neutral_position_steps": 2165,
+      "open_position_steps": 2147,
+      "speed": 1200,
+      "grip_strength": 100,
+      "status_frequency_hz": 50,
+      "calibration_step_steps": 128,
+      "motion_timeout_s": 30
+    }
   ]
 }

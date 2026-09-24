@@ -65,7 +65,7 @@ def default_servo_config(selected: dict | None = None) -> dict:
         "neutral_position_steps": None,
         "open_position_steps": None,
         "speed": 1200,
-        "grip_strength": 60,
+        "grip_strength": 100,
         "status_frequency_hz": 50,
         "calibration_step_steps": 128,
         "motion_timeout_s": 30,
