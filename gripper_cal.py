@@ -80,8 +80,8 @@ def optional_grip_test(gripper, config, channel):
     strength = gripper.guided_grip_test(channel)
     if strength is None:
         return
-    config["grip_strength"] = strength
-    print("已保存夹紧力度。")
+    config["close_grip_strength"] = strength
+    print("已保存闭合力度，张开力度保持原设置。")
 
 
 def completed_config(config):

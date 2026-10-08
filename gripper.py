@@ -49,8 +49,15 @@ def _read_json(path: Path) -> dict:
 
 
 def save_config(config: dict, path: str | Path = DEFAULT_CONFIG_PATH) -> None:
+    saved = dict(config) if "servos" in config else {}
+    saved["servos"] = [
+        {key: value for key, value in item.items() if key != "calibration_grip_strength"}
+        if item is not None
+        else None
+        for item in _servos(config)
+    ]
     Path(path).write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(saved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
 
@@ -65,7 +72,9 @@ def default_servo_config(selected: dict | None = None) -> dict:
         "neutral_position_steps": None,
         "open_position_steps": None,
         "speed": 1200,
-        "grip_strength": 100,
+        "calibration_grip_strength": 40,
+        "open_grip_strength": 40,
+        "close_grip_strength": 40,
         "status_frequency_hz": 50,
         "calibration_step_steps": 128,
         "motion_timeout_s": 30,
@@ -85,15 +94,31 @@ def _integer(config: dict, key: str, low: int, high: int) -> int:
 
 def _servos(config: dict) -> list[dict | None]:
     if "servos" not in config:
-        return [dict(config), None]
-    value = config["servos"]
+        value = [config, None]
+    else:
+        value = config["servos"]
     if (
         not isinstance(value, list)
         or len(value) != 2
         or any(x is not None and not isinstance(x, dict) for x in value)
     ):
         raise ConfigError("配置项“servos”必须是包含两个配置对象或 null 的列表。")
-    return [dict(x) if x is not None else None for x in value]
+    servos = []
+    for item in value:
+        if item is None:
+            servos.append(None)
+            continue
+        item = dict(item)
+        old_strength = item.pop("grip_strength", None)
+        if old_strength is not None:
+            item.setdefault("open_grip_strength", old_strength)
+            item.setdefault("close_grip_strength", old_strength)
+        # 标定力度只取代码中的默认值，不接受 JSON 中的同名设置。
+        item["calibration_grip_strength"] = default_servo_config()[
+            "calibration_grip_strength"
+        ]
+        servos.append(item)
+    return servos
 
 
 def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
@@ -102,7 +127,8 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
         "servo_id",
         "baudrate",
         "speed",
-        "grip_strength",
+        "open_grip_strength",
+        "close_grip_strength",
         "status_frequency_hz",
         "calibration_step_steps",
         "motion_timeout_s",
@@ -115,7 +141,9 @@ def _validate_servo(config: dict, channel: int, calibrated: bool) -> None:
     _integer(config, "servo_id", 0, 253)
     _integer(config, "baudrate", 9600, 1_000_000)
     _integer(config, "speed", 1, 3400)
-    _integer(config, "grip_strength", 1, 100)
+    _integer(config, "calibration_grip_strength", 1, 100)
+    _integer(config, "open_grip_strength", 1, 100)
+    _integer(config, "close_grip_strength", 1, 100)
     _integer(config, "status_frequency_hz", 1, 100)
     _integer(config, "calibration_step_steps", 10, 1024)
     _integer(config, "motion_timeout_s", 2, 120)
@@ -398,7 +426,9 @@ class _Channel:
     next_status: float = 0
     initial_position_ready: threading.Event = field(default_factory=threading.Event)
     initial_position_error: GripperError | None = None
-    pending_strength: int | None = None
+    applied_strength: int | None = None
+    active_strength_key: str | None = None
+    pending_strength: tuple[str, int] | None = None
     strength_error: GripperError | None = None
     strength_applied: threading.Event = field(default_factory=threading.Event)
 
@@ -441,7 +471,14 @@ class Gripper:
                 sid = item.config["servo_id"]
                 item.bus.verify(sid)
                 item.bus.check_position_mode(sid)
-                item.bus.prepare(sid, item.config["grip_strength"])
+                strength_key = (
+                    "close_grip_strength"
+                    if item.calibrated
+                    else "calibration_grip_strength"
+                )
+                item.bus.prepare(sid, item.config[strength_key])
+                item.applied_strength = item.config[strength_key]
+                item.active_strength_key = strength_key
                 item.stopped.set()
                 item.state = {
                     "state": "正在读取当前位置",
@@ -646,20 +683,23 @@ class Gripper:
             )
             item.stopped.set()
 
-    def set_grip_strength(self, strength, channel=None):
-        """由后台循环写入新的扭矩上限，并等待实际写入完成。"""
+    def set_grip_strength(self, strength, channel=None, *, direction="闭合"):
+        """更新指定方向的力度；当前正在使用时由后台立即写入。"""
         if (
             isinstance(strength, bool)
             or not isinstance(strength, int)
             or not 1 <= strength <= 100
         ):
             raise ValueError("夹紧力度必须是 1 到 100 的整数。")
+        if direction not in {"张开", "闭合"}:
+            raise ValueError("力度方向只能为“张开”或“闭合”。")
+        key = "open_grip_strength" if direction == "张开" else "close_grip_strength"
         item = self._channel(channel)
         with self.strength_lock:
             with self.lock:
                 if self.stop_event.is_set():
                     raise GripperError("夹爪已断开，无法更新夹紧力度。")
-                item.pending_strength = strength
+                item.pending_strength = (key, strength)
                 item.strength_error = None
                 item.strength_applied.clear()
             self.wakeup.set()
@@ -669,13 +709,28 @@ class Gripper:
                 if item.strength_error is not None:
                     raise item.strength_error
 
+    def _apply_strength(self, item, key, strength=None):
+        """仅在力度数值变化时写入；只能由后台循环调用。"""
+        with self.lock:
+            if strength is None:
+                strength = item.config[key]
+            changed = strength != item.applied_strength
+        if changed:
+            item.bus.set_grip_strength(item.config["servo_id"], strength)
+        with self.lock:
+            item.applied_strength = strength
+            item.active_strength_key = key
+
     def _apply_pending_strength(self, item):
         with self.lock:
-            strength = item.pending_strength
-        if strength is None:
+            pending = item.pending_strength
+            active_key = item.active_strength_key
+        if pending is None:
             return
+        key, strength = pending
         try:
-            item.bus.set_grip_strength(item.config["servo_id"], strength)
+            if key == active_key:
+                self._apply_strength(item, key, strength)
         except GripperError as exc:
             with self.lock:
                 item.pending_strength = None
@@ -683,7 +738,7 @@ class Gripper:
                 item.strength_applied.set()
             return
         with self.lock:
-            item.config["grip_strength"] = strength
+            item.config[key] = strength
             item.pending_strength = None
             item.strength_error = None
             item.strength_applied.set()
@@ -747,6 +802,19 @@ class Gripper:
             if remaining <= POSITION_TOLERANCE_STEPS:
                 self._request_stop(item, "已到位", "已到达目标位置。")
             elif item.sent_version != version:
+                strength_key = (
+                    "calibration_grip_strength"
+                    if not item.calibrated
+                    else (
+                        "open_grip_strength"
+                        if direction == "张开"
+                        else "close_grip_strength"
+                    )
+                )
+                self._apply_strength(item, strength_key)
+                with self.lock:
+                    if item.version != version:
+                        return
                 item.bus.set_position(item.config["servo_id"], target, target_speed)
                 with self.lock:
                     if item.version != version:
@@ -879,7 +947,7 @@ class Gripper:
         item = self._channel(channel)
         if not item.calibrated:
             raise GripperError("请先完成闭合、中立和张开位置标定。")
-        original_strength = item.config["grip_strength"]
+        original_strength = item.config["close_grip_strength"]
         strength = original_strength
 
         def open_to_maximum():
@@ -890,7 +958,8 @@ class Gripper:
 
         open_to_maximum()
         print(
-            f"\n{item.index} 号舵机夹紧测试，当前力度：{strength}。"
+            f"\n{item.index} 号舵机夹紧测试，当前闭合力度：{strength}，"
+            f"张开力度：{item.config['open_grip_strength']}。"
             "请放入测试物，按回车自动闭合；Q 退出。"
         )
         waiting_to_close = True
@@ -909,8 +978,8 @@ class Gripper:
                     if result["state"] == "异常":
                         raise GripperError("闭合夹爪失败：" + result["message"])
                     print(
-                        f"本轮力度：{strength}。感受夹持效果后："
-                        "按 W 增加 5，按 S 减少 5，按回车确认保存。"
+                        f"本轮闭合力度：{strength}。感受夹持效果后："
+                        "按 W 将闭合力度增加 5，按 S 减少 5，按回车确认保存。"
                     )
                     waiting_to_close = False
                     continue
@@ -921,11 +990,11 @@ class Gripper:
                         continue
                     self.set_grip_strength(updated, item.index)
                     strength = updated
-                    print(f"当前力度已更新为：{strength}。正在重新张开夹爪。")
+                    print(f"当前闭合力度已更新为：{strength}。正在重新张开夹爪。")
                     open_to_maximum()
                     print("请重新放入测试物，按回车自动闭合；Q 退出。")
                     waiting_to_close = True
                     continue
                 if not waiting_to_close and key in {"\r", "\n"}:
-                    print(f"已确认夹紧力度：{strength}。\n")
+                    print(f"已确认闭合力度：{strength}。\n")
                     return strength

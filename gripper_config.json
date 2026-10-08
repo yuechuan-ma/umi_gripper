@@ -10,7 +10,8 @@
       "neutral_position_steps": 2165,
       "open_position_steps": 2147,
       "speed": 1200,
-      "grip_strength": 100,
+      "open_grip_strength": 40,
+      "close_grip_strength": 40,
       "status_frequency_hz": 50,
       "calibration_step_steps": 128,
       "motion_timeout_s": 30
