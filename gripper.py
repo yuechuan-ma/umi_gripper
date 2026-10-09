@@ -915,7 +915,7 @@ class Gripper:
                 STEPS_PER_TURN - 1,
                 max(0, item.position + direction * item.config["calibration_step_steps"]),
             ),
-            speed=min(item.config["speed"], 300),
+            speed=min(item.config["speed"], 600),
         )
 
     def _keyboard(self, item, name):
